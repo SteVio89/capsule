@@ -75,6 +75,7 @@ rewrite_flake() {
 inject_pkgs() {
   local marker='# devhelper:packages' indent
   indent=$(awk -v m="$marker" 'index($0, m) { match($0, /^[ \t]+/); print substr($0, 1, RLENGTH); exit }' flake.nix)
+  # shellcheck disable=SC2016  # single quotes protect the awk program, not shell vars
   rewrite_flake awk -v m="$marker" -v ind="$indent" -v pkgs="$*" '
     index($0, m) { n = split(pkgs, arr, " "); for (i = 1; i <= n; i++) print ind arr[i] }
     { print }
@@ -85,6 +86,7 @@ inject_pkgs() {
 # Literal compare (not `~` regex): `capsule rm python3Packages.foo` must not also match
 # python3PackagesXfoo, and names with regex metachars must not silently over-match.
 strip_pkgs() {
+  # shellcheck disable=SC2016  # single quotes protect the awk program, not shell vars
   rewrite_flake awk -v pkgs="$*" '
     BEGIN { n = split(pkgs, arr, " ") }
     { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line)
