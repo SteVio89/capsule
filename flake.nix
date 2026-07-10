@@ -38,7 +38,7 @@
                 --prefix PATH : ${
                   pkgs.lib.makeBinPath (
                     with pkgs;
-                    [ git openssh curl jq coreutils gnused gawk gnutar gzip findutils ]
+                    [ git curl jq coreutils gnused gawk gnutar gzip findutils ]
                     ++ lib.optionals stdenv.isDarwin [ qemu butane xz ]
                   )
                 }
