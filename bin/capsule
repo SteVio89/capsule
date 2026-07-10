@@ -289,6 +289,13 @@ cmd_ssh() {
   exec ssh -o StrictHostKeyChecking=accept-new -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST" "$@"
 }
 
+cmd_stop() {
+  host_only stop
+  vm_reachable
+  ssh_vm "sudo poweroff" 2>/dev/null || true
+  echo "capsule: VM shutting down"
+}
+
 cmd_destroy() {
   host_only destroy
   local img="$CAPSULE_DATA/fcos.qcow2"
@@ -381,6 +388,7 @@ ${b}capsule${r}   (host only)
   ${d}pull${r}                pull the published image, dropping the stale nix volume
   ${d}image${r}               build the image locally instead
   ${d}gc${r}                  prune containers/images, collect nix garbage
+  ${d}stop${r}                power off the VM (disk is kept)
   ${d}destroy${r}             delete the VM disk (asks first)
 
 ${b}handoff${r}   (host only)
@@ -408,6 +416,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
     pull)   cmd_pull ;;
     image)  cmd_image ;;
     gc)     cmd_gc ;;
+    stop)   cmd_stop ;;
     destroy) cmd_destroy ;;
     push)   cmd_push ;;
     fetch)  cmd_fetch ;;

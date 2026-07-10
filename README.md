@@ -104,9 +104,11 @@ capsule merge              # diffstat, confirm, merge --no-ff
 | `shell [profile]` | start the agent container for `$PWD` (default profile: `default`) |
 | `vm` | boot the qemu VM, downloading the disk if needed |
 | `ssh [cmd...]` | ssh into the VM, or run one command there |
+| `size` | show the VM disk's actual vs virtual size |
 | `pull` | pull the published image, dropping the stale nix volume |
 | `image` | build the image locally instead |
 | `gc` | prune containers/images, collect Nix garbage |
+| `stop` | power off the VM (disk is kept) |
 | `destroy` | delete the VM disk (asks first) |
 
 **Handoff** (host only):
