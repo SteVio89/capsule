@@ -272,6 +272,14 @@ cmd_gc() {
   ssh_vm "df -h /"
 }
 
+cmd_size() {
+  host_only size
+  local img="$CAPSULE_DATA/fcos.qcow2"
+  [[ -e $img ]] || die "no VM disk at $img — run 'capsule vm' first"
+  # qcow2 is sparse: "disk size" is what the host allocates now, "virtual size" is the guest's 80G.
+  qemu-img info "$img" | grep -E 'virtual size|disk size'
+}
+
 cmd_ssh() {
   host_only ssh
   vm_reachable
@@ -369,6 +377,7 @@ ${b}capsule${r}   (host only)
   ${d}shell${r} [profile]     start the agent container for \$PWD (default: default)
   ${d}vm${r}                  boot the qemu VM, downloading the disk if needed
   ${d}ssh${r} [cmd...]        ssh into the VM, or run one command there
+  ${d}size${r}                show the VM disk's actual vs virtual size
   ${d}pull${r}                pull the published image, dropping the stale nix volume
   ${d}image${r}               build the image locally instead
   ${d}gc${r}                  prune containers/images, collect nix garbage
@@ -395,6 +404,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
     shell)  shift; cmd_shell "$@" ;;
     vm)     cmd_vm ;;
     ssh)    shift; cmd_ssh "$@" ;;
+    size)   cmd_size ;;
     pull)   cmd_pull ;;
     image)  cmd_image ;;
     gc)     cmd_gc ;;
