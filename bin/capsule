@@ -52,9 +52,12 @@ drop_nix_volume() {
   ssh_vm "if podman volume exists capsule-nix; then podman volume rm capsule-nix; fi"
 }
 
+vm_running() {
+  timeout 2 bash -c "echo > /dev/tcp/${CAPSULE_VM_HOST##*@}/${CAPSULE_VM_PORT}" 2>/dev/null
+}
+
 vm_reachable() {
-  timeout 2 bash -c "echo > /dev/tcp/${CAPSULE_VM_HOST##*@}/${CAPSULE_VM_PORT}" 2>/dev/null \
-    || die "VM not reachable on ${CAPSULE_VM_HOST}:${CAPSULE_VM_PORT} — run 'capsule vm'"
+  vm_running || die "VM not reachable on ${CAPSULE_VM_HOST}:${CAPSULE_VM_PORT} — run 'capsule vm'"
 }
 
 # ---------------------------------------------------------------- project
@@ -276,8 +279,9 @@ cmd_size() {
   host_only size
   local img="$CAPSULE_DATA/fcos.qcow2"
   [[ -e $img ]] || die "no VM disk at $img — run 'capsule vm' first"
+  vm_running && echo "capsule: VM is running — sizes may lag slightly" >&2
   # qcow2 is sparse: "disk size" is what the host allocates now, "virtual size" is the guest's 80G.
-  qemu-img info "$img" | grep -E 'virtual size|disk size'
+  qemu-img info -U "$img" | grep -E 'virtual size|disk size'
 }
 
 cmd_ssh() {
