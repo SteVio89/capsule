@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/capsule/config"
+# shellcheck source=/dev/null
+[[ -f $conf ]] && source "$conf"
+
+# Resolve through symlinks: `ln -s .../capsule ~/.local/bin/capsule` must still find share/.
+self_src="${BASH_SOURCE[0]}"
+while [[ -L $self_src ]]; do
+  self_dir="$(cd "$(dirname "$self_src")" && pwd)"
+  self_src="$(readlink "$self_src")"
+  [[ $self_src == /* ]] || self_src="$self_dir/$self_src"
+done
+self_dir="$(cd "$(dirname "$self_src")" && pwd)"
+
+: "${CAPSULE_ROOT:=$HOME/code}"
+: "${CAPSULE_VM_HOST:=core@localhost}"
+: "${CAPSULE_VM_PORT:=2222}"
+: "${CAPSULE_IMAGE:=ghcr.io/stevio89/capsule:latest}"
+: "${CAPSULE_CONTAINER_HOME:=/home/agent}"
+: "${CAPSULE_BRANCH:=capsule}"
+: "${CAPSULE_DATA:=${XDG_DATA_HOME:-$HOME/.local/share}/capsule}"
+: "${CAPSULE_SSH_KEY:=$HOME/.ssh/id_ed25519.pub}"
+: "${CAPSULE_VM_CPUS:=4}"
+: "${CAPSULE_VM_MEM:=6144}"
+: "${CAPSULE_DISK_SIZE:=80G}"
+: "${CAPSULE_STREAM:=stable}"
+: "${CAPSULE_SRC:=$(cd "$self_dir/.." && pwd)}"
+: "${CAPSULE_SHARE:=$CAPSULE_SRC/share}"
+
+die() { echo "capsule: $*" >&2; exit 1; }
+
+# Every VM path splits CAPSULE_VM_HOST into ssh user (before @) and host (after @). A
+# bare host would make `%%@*` return the whole string as the "user" and silently build
+# wrong replica paths, so require the user@host form up front.
+[[ $CAPSULE_VM_HOST == *@* ]] || die "CAPSULE_VM_HOST must be user@host (got '$CAPSULE_VM_HOST')"
+
+in_container() { [[ -n ${CAPSULE_PROFILE:-} ]]; }
+host_only() {
+  if in_container; then die "'$1' runs on the host, not inside the capsule"; fi
+}
+
+# accept-new adds an unknown host key without prompting, but still refuses a *changed*
+# one. git uses the same known_hosts, so it stays consistent with plain `git push vm`.
+ssh_vm() { ssh -o StrictHostKeyChecking=accept-new -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST" "$@"; }
+
+# The named volume shadows /nix from any new image, so a new image means dropping it.
+# It goes first: while a capsule is running the volume is in use and podman refuses,
+# which aborts before anything is pulled or built rather than after.
+drop_nix_volume() {
+  ssh_vm "if podman volume exists capsule-nix; then podman volume rm capsule-nix; fi"
+}
+
+vm_reachable() {
+  timeout 2 bash -c "echo > /dev/tcp/${CAPSULE_VM_HOST##*@}/${CAPSULE_VM_PORT}" 2>/dev/null \
+    || die "VM not reachable on ${CAPSULE_VM_HOST}:${CAPSULE_VM_PORT} — run 'capsule vm'"
+}
+
+# ---------------------------------------------------------------- project
+
+template() { echo "$CAPSULE_SHARE/templates"; }
+
+# Rewrite flake.nix through a sibling temp file, so the replacement is a rename(2)
+# on the same filesystem rather than a copy.
+rewrite_flake() {
+  local tmp; tmp=$(mktemp ./flake.nix.XXXXXX) || die "cannot write to $PWD"
+  if "$@" < flake.nix > "$tmp"; then
+    mv "$tmp" flake.nix
+  else
+    rm -f "$tmp"; die "failed to rewrite flake.nix"
+  fi
+}
+
+inject_pkgs() {
+  local marker='# devhelper:packages' indent
+  indent=$(awk -v m="$marker" 'index($0, m) { match($0, /^[ \t]+/); print substr($0, 1, RLENGTH); exit }' flake.nix)
+  rewrite_flake awk -v m="$marker" -v ind="$indent" -v pkgs="$*" '
+    index($0, m) { n = split(pkgs, arr, " "); for (i = 1; i <= n; i++) print ind arr[i] }
+    { print }
+  '
+}
+
+# Drop any injected package line whose trimmed content exactly equals a named package.
+# Literal compare (not `~` regex): `capsule rm python3Packages.foo` must not also match
+# python3PackagesXfoo, and names with regex metachars must not silently over-match.
+strip_pkgs() {
+  rewrite_flake awk -v pkgs="$*" '
+    BEGIN { n = split(pkgs, arr, " ") }
+    { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line)
+      keep = 1
+      for (i = 1; i <= n; i++) if (line == arr[i]) { keep = 0; break }
+      if (keep) print }
+  '
+}
+
+# True when $1 is already an injected package: an indented line equal to the name.
+pkg_present() {
+  awk -v p="$1" '
+    { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line); if (line == p) found = 1 }
+    END { exit !found }' flake.nix
+}
+
+cmd_init() {
+  [[ -f flake.nix ]] && die "flake.nix already exists — refusing to overwrite"
+  local helpers lang="${1:-}" name="${2:-}" project
+  helpers="$(template)"
+  if [[ -n $lang && ! -d $helpers/$lang ]]; then
+    die "unknown language: $lang — available: $(find "$helpers" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | paste -sd, -)"
+  fi
+  project="${name:-$(basename "$PWD")}"
+  sed "s/PROJECT_NAME/${project}/g" "$helpers/devshell-flake.nix" > flake.nix
+  if [[ -n $lang ]]; then
+    # shellcheck disable=SC2046
+    inject_pkgs $(grep -v '^[[:space:]]*$' "$helpers/$lang/packages")
+    [[ -f justfile ]] || install -m 644 "$helpers/$lang/justfile" justfile
+  fi
+  [[ -f .envrc ]] || echo "use flake" > .envrc
+  if [[ -f .gitignore ]]; then
+    grep -q '\.direnv' .gitignore || printf '\n.direnv/\n' >> .gitignore
+  else
+    echo ".direnv/" > .gitignore
+  fi
+  [[ -d .git ]] || git init -q
+  direnv allow
+}
+
+cmd_add() {
+  [[ -f flake.nix ]] || die "no flake.nix — run 'capsule init' first"
+  [[ $# -gt 0 ]] || die "usage: capsule add <pkg>..."
+  local p; local -a fresh=()
+  for p in "$@"; do
+    case " ${fresh[*]:-} " in *" $p "*) continue ;; esac   # duplicate within this batch
+    if pkg_present "$p"; then
+      echo "capsule: $p already present — skipping" >&2
+    else
+      fresh+=("$p")
+    fi
+  done
+  [[ ${#fresh[@]} -gt 0 ]] || { echo "capsule: nothing to add"; return 0; }
+  inject_pkgs "${fresh[@]}"
+  direnv reload
+}
+
+cmd_rm() {
+  [[ -f flake.nix ]] || die "no flake.nix here"
+  [[ $# -gt 0 ]] || die "usage: capsule rm <pkg>..."
+  strip_pkgs "$@"
+  direnv reload
+}
+
+cmd_update() {
+  [[ -f flake.nix ]] || die "no flake.nix here"
+  nix flake update && direnv reload
+}
+
+# ---------------------------------------------------------------- git handoff
+
+need_remote() {
+  git remote get-url vm >/dev/null 2>&1 \
+    || die "no 'vm' remote — run 'capsule shell' once to bootstrap"
+}
+
+need_fetched() {
+  need_remote
+  git rev-parse --verify -q "vm/$CAPSULE_BRANCH" >/dev/null \
+    || die "no vm/$CAPSULE_BRANCH — run 'capsule fetch' first"
+}
+
+cmd_push()   { host_only push;   need_remote; git push vm "HEAD:$CAPSULE_BRANCH"; }
+cmd_fetch()  { host_only fetch;  need_remote; git fetch vm; }
+cmd_review() { host_only review; need_fetched; git log -p --reverse "HEAD..vm/$CAPSULE_BRANCH"; }
+
+cmd_merge() {
+  host_only merge
+  need_fetched
+  local n here
+  n=$(git rev-list --count "HEAD..vm/$CAPSULE_BRANCH")
+  here=$(git rev-parse --abbrev-ref HEAD)
+  if (( n == 0 )); then
+    echo "nothing to merge — vm/$CAPSULE_BRANCH has no commits beyond $here"
+    return 0
+  fi
+  echo "merging $n commit(s) from vm/$CAPSULE_BRANCH into $here:"
+  git log --oneline --reverse "HEAD..vm/$CAPSULE_BRANCH"
+  echo
+  git diff --stat "HEAD...vm/$CAPSULE_BRANCH"
+  echo
+  # Read from the terminal, never stdin: `echo y | capsule merge` must not confirm.
+  local ans
+  read -r -n1 -p "merge these? [y/N] " ans < /dev/tty || die "not a terminal"
+  echo
+  [[ $ans == [yY] ]] || { echo "aborted"; return 1; }
+  git merge --no-ff "vm/$CAPSULE_BRANCH"
+}
+
+# ---------------------------------------------------------------- capsule
+
+cmd_shell() {
+  host_only shell
+  local profile="${1:-default}"
+  [[ "$profile" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid profile '$profile' (use [A-Za-z0-9_-])"
+
+  local root="${CAPSULE_ROOT%/}" proj="$PWD" name
+  case "$proj/" in "$root"/*) ;; *) die "$proj is outside CAPSULE_ROOT ($root)" ;; esac
+  name="$(basename "$proj")"
+
+  vm_reachable
+  git -C "$proj" rev-parse --git-dir >/dev/null 2>&1 || die "$proj is not a git repository"
+
+  if ! ssh_vm "test -d ~/$name/.git"; then
+    echo "capsule: bootstrapping $name in VM"
+    ssh_vm "git init -q -b $CAPSULE_BRANCH ~/$name \
+      && git -C ~/$name config receive.denyCurrentBranch updateInstead"
+    git -C "$proj" remote get-url vm >/dev/null 2>&1 \
+      || git -C "$proj" remote add vm \
+           "ssh://${CAPSULE_VM_HOST}:${CAPSULE_VM_PORT}/home/${CAPSULE_VM_HOST%%@*}/$name"
+    git -C "$proj" push -q vm "HEAD:$CAPSULE_BRANCH"
+  fi
+
+  printf '\n  capsule  profile=%s  project=%s\n\n' "$profile" "$name"
+
+  local h="$CAPSULE_CONTAINER_HOME"
+  exec ssh -t -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST" \
+    "mkdir -p ~/.capsule/$profile/claude ~/.capsule/$profile/cursor ~/.capsule/cache \
+     && cd ~/$name && podman run --rm -it \
+       --security-opt label=disable \
+       -e DOCKER_HOST=unix:///run/podman.sock \
+       -e TESTCONTAINERS_RYUK_DISABLED=true \
+       -e TESTCONTAINERS_HOST_OVERRIDE=host.containers.internal \
+       -e CAPSULE_PROFILE=$profile \
+       -v capsule-nix:/nix \
+       -v /run/user/\$(id -u)/podman/podman.sock:/run/podman.sock \
+       -v ~/.capsule/cache:$h/.cache \
+       -v ~/.capsule/$profile/claude:$h/.claude \
+       -v ~/.capsule/$profile/cursor:$h/.config/cursor \
+       -v \"\$PWD:\$PWD\" -w \"\$PWD\" \
+       $CAPSULE_IMAGE"
+}
+
+cmd_pull() {
+  host_only pull
+  vm_reachable
+  drop_nix_volume
+  # Pulling a moved :latest untags the old image; it lingers as <none> until pruned.
+  ssh_vm "podman pull $CAPSULE_IMAGE && podman image prune -f"
+}
+
+cmd_image() {
+  host_only image
+  vm_reachable
+  local src="$CAPSULE_SRC"
+  [[ -d $src/container ]] || die "container/ not found under CAPSULE_SRC ($src)"
+  drop_nix_volume
+  ssh_vm "rm -rf ~/capsule-src"
+  COPYFILE_DISABLE=1 tar czf - -C "$src" --exclude .git --exclude .direnv bin container share \
+    | ssh_vm "mkdir -p ~/capsule-src && tar xzf - -C ~/capsule-src"
+  ssh_vm "podman build -f ~/capsule-src/container/Dockerfile -t $CAPSULE_IMAGE ~/capsule-src \
+          && podman image prune -f"
+}
+
+cmd_gc() {
+  host_only gc
+  vm_reachable
+  ssh_vm "podman container prune -f && podman image prune -f"
+  # No -d: it deletes the only generation of the default profile, taking cacert with it.
+  # Mount the cache: nix-direnv's gc roots point into it, and dangling roots eat every devshell.
+  ssh_vm "podman run --rm -v capsule-nix:/nix -v ~/.capsule/cache:$CAPSULE_CONTAINER_HOME/.cache \
+            --security-opt label=disable $CAPSULE_IMAGE -c 'nix-collect-garbage'"
+  ssh_vm "df -h /"
+}
+
+cmd_ssh() {
+  host_only ssh
+  vm_reachable
+  if [[ $# -eq 0 ]]; then
+    exec ssh -t -o StrictHostKeyChecking=accept-new -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST"
+  fi
+  exec ssh -o StrictHostKeyChecking=accept-new -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST" "$@"
+}
+
+cmd_destroy() {
+  host_only destroy
+  local img="$CAPSULE_DATA/fcos.qcow2"
+  [[ -e $img ]] || die "no VM disk at $img"
+  echo "this deletes the VM disk at $img"
+  echo "gone with it: the container image, every project replica, and all agent logins"
+  echo "(your projects on this machine are untouched)"
+  local ans
+  read -r -n1 -p "destroy? [y/N] " ans < /dev/tty || die "not a terminal"
+  echo
+  [[ $ans == [yY] ]] || { echo "aborted"; return 1; }
+  rm -f "$img" "$CAPSULE_DATA/fcos.ign"
+  ssh-keygen -R "[${CAPSULE_VM_HOST##*@}]:${CAPSULE_VM_PORT}" >/dev/null 2>&1 || true
+  echo "capsule: destroyed — 'capsule vm' will fetch a fresh disk"
+}
+
+cmd_vm() {
+  host_only vm
+  [[ "$(uname -m)" == arm64 || "$(uname -m)" == aarch64 ]] \
+    || die "capsule vm only supports aarch64 hosts (found $(uname -m)); point CAPSULE_VM_HOST at a real machine instead"
+  [[ -r $CAPSULE_SSH_KEY ]] || die "no ssh public key at $CAPSULE_SSH_KEY (set CAPSULE_SSH_KEY)"
+
+  mkdir -p "$CAPSULE_DATA"
+  local img="$CAPSULE_DATA/fcos.qcow2"
+
+  if [[ ! -e $img ]]; then
+    # A fresh disk means a fresh host key; drop the stale entry so ssh accepts the new one.
+    ssh-keygen -R "[${CAPSULE_VM_HOST##*@}]:${CAPSULE_VM_PORT}" >/dev/null 2>&1 || true
+    echo "capsule: no disk yet, fetching Fedora CoreOS ($CAPSULE_STREAM, aarch64)"
+    local meta url want xz got
+    meta=$(curl -fsSL "https://builds.coreos.fedoraproject.org/streams/${CAPSULE_STREAM}.json")
+    read -r url want <<<"$(jq -r \
+      '.architectures.aarch64.artifacts.qemu.formats["qcow2.xz"].disk | "\(.location) \(.sha256)"' \
+      <<<"$meta")"
+    [[ -n $url && $url != null ]] || die "could not resolve image url from stream metadata"
+
+    xz="$CAPSULE_DATA/${url##*/}"
+    curl -fL -C - -o "$xz" "$url"
+    got=$(shasum -a 256 "$xz" | cut -d' ' -f1)
+    [[ $got == "$want" ]] || die "checksum mismatch on $xz (expected $want, got $got)"
+
+    # Resize before the first boot: FCOS grows root to fill the disk on boot 1.
+    unxz -c "$xz" > "$img"
+    qemu-img resize "$img" "$CAPSULE_DISK_SIZE"
+    rm -f "$xz"
+  fi
+
+  # Regenerated every start: a stale ignition silently ignores every config change.
+  local ign="$CAPSULE_DATA/fcos.ign"
+  sed "s|@SSH_KEY@|$(<"$CAPSULE_SSH_KEY")|" "${CAPSULE_BUTANE:-$CAPSULE_SHARE/fcos.bu.tmpl}" \
+    | butane --strict > "$ign"
+
+  local qemu fw
+  qemu=$(command -v qemu-system-aarch64) || die "qemu-system-aarch64 not found"
+  fw="$(dirname "$(dirname "$(readlink -f "$qemu")")")/share/qemu/edk2-aarch64-code.fd"
+  [[ -r $fw ]] || die "UEFI firmware not found at $fw"
+
+  echo "capsule: booting VM (${CAPSULE_VM_CPUS} cpu, ${CAPSULE_VM_MEM}M, ssh on :${CAPSULE_VM_PORT})"
+  exec "$qemu" \
+    -machine virt,accel=hvf -cpu host \
+    -smp "$CAPSULE_VM_CPUS" -m "$CAPSULE_VM_MEM" \
+    -nographic \
+    -bios "$fw" \
+    -drive "if=virtio,file=$img,discard=unmap,detect-zeroes=unmap" \
+    -fw_cfg "name=opt/com.coreos/config,file=$ign" \
+    -nic "user,hostfwd=tcp::${CAPSULE_VM_PORT}-:22"
+}
+
+# ---------------------------------------------------------------- dispatch
+
+usage() {
+  local b='' d='' r=''
+  if [[ -t 1 ]]; then b=$'\e[1m'; d=$'\e[36m'; r=$'\e[0m'; fi
+  cat <<EOF
+
+${b}capsule${r} — run coding agents in a container, on a VM, on a git replica
+
+${b}project${r}   (works on the host and inside the capsule)
+  ${d}init${r} [lang] [name]  scaffold flake.nix, .envrc, .gitignore, git repo
+  ${d}add${r} <pkg>...        add packages to flake.nix
+  ${d}rm${r} <pkg>...         remove packages from flake.nix
+  ${d}update${r}              nix flake update, then reload
+  ${d}reload${r}              direnv reload
+
+${b}capsule${r}   (host only)
+  ${d}shell${r} [profile]     start the agent container for \$PWD (default: default)
+  ${d}vm${r}                  boot the qemu VM, downloading the disk if needed
+  ${d}ssh${r} [cmd...]        ssh into the VM, or run one command there
+  ${d}pull${r}                pull the published image, dropping the stale nix volume
+  ${d}image${r}               build the image locally instead
+  ${d}gc${r}                  prune containers/images, collect nix garbage
+  ${d}destroy${r}             delete the VM disk (asks first)
+
+${b}handoff${r}   (host only)
+  ${d}push${r}                git push vm HEAD:$CAPSULE_BRANCH
+  ${d}fetch${r}               git fetch vm — refs only, nothing else changes
+  ${d}review${r}              show every commit and patch waiting in vm/$CAPSULE_BRANCH
+  ${d}merge${r}               diffstat, confirm, merge --no-ff
+
+EOF
+}
+
+# Dispatch only when executed, not when sourced — test/capsule-test.sh sources this file
+# to drive the package helpers directly.
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+  case "${1:-}" in
+    init)   shift; cmd_init "$@" ;;
+    add)    shift; cmd_add "$@" ;;
+    rm)     shift; cmd_rm "$@" ;;
+    update) cmd_update ;;
+    reload) direnv reload ;;
+    shell)  shift; cmd_shell "$@" ;;
+    vm)     cmd_vm ;;
+    ssh)    shift; cmd_ssh "$@" ;;
+    pull)   cmd_pull ;;
+    image)  cmd_image ;;
+    gc)     cmd_gc ;;
+    destroy) cmd_destroy ;;
+    push)   cmd_push ;;
+    fetch)  cmd_fetch ;;
+    review) cmd_review ;;
+    merge)  cmd_merge ;;
+    ""|help|-h|--help) usage ;;
+    *)      echo "capsule: unknown command '$1'" >&2; usage >&2; exit 2 ;;
+  esac
+fi

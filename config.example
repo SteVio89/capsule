@@ -1,0 +1,27 @@
+# capsule config — copy to ~/.config/capsule/config
+# Sourced as shell script. Anything set here wins over the defaults below.
+
+# Projects must live under this directory; capsule refuses to start anywhere else.
+CAPSULE_ROOT="$HOME/code"
+
+# Where the agent runs. Point this at a physical Linux box and `capsule vm` becomes
+# unnecessary — everything else keeps working.
+CAPSULE_VM_HOST="core@localhost"
+CAPSULE_VM_PORT=2222
+
+# Container image and the agent user's home inside it. The default is the published
+# multi-arch image; podman pulls it on first use. `capsule image` builds it locally
+# under the same tag, so a local build always wins.
+CAPSULE_IMAGE="ghcr.io/stevio89/capsule:latest"
+CAPSULE_CONTAINER_HOME="/home/agent"
+
+# The branch the agent commits on, in the VM's replica of your repo.
+CAPSULE_BRANCH="capsule"
+
+# `capsule vm` only — qemu on an aarch64 host.
+CAPSULE_SSH_KEY="$HOME/.ssh/id_ed25519.pub"
+CAPSULE_DATA="$HOME/.local/share/capsule"
+CAPSULE_VM_CPUS=4
+CAPSULE_VM_MEM=6144
+CAPSULE_DISK_SIZE="80G"
+CAPSULE_STREAM="stable"

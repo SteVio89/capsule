@@ -1,0 +1,77 @@
+name: container image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - container/**
+      - bin/capsule
+      - share/**
+      - .github/workflows/image.yml
+  # No container flake.lock is committed, so every build re-locks nixpkgs to latest.
+  # This weekly rebuild is what keeps claude-code and cursor-cli fresh.
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+env:
+  # Same name as the repo: ghcr links the package to it and inherits its visibility.
+  IMAGE: capsule
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase the registry namespace
+        id: ns
+        run: echo "ns=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" \
+               | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build
+        run: |
+          podman build \
+            -f container/Dockerfile \
+            -t "ghcr.io/${{ steps.ns.outputs.ns }}/$IMAGE:${{ matrix.arch }}" \
+            .
+
+      - name: Push
+        run: podman push "ghcr.io/${{ steps.ns.outputs.ns }}/$IMAGE:${{ matrix.arch }}"
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - name: Lowercase the registry namespace
+        id: ns
+        run: echo "ns=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" \
+               | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # One name, both architectures: podman on the VM picks by its own platform.
+      - name: Assemble multi-arch manifest
+        run: |
+          repo="ghcr.io/${{ steps.ns.outputs.ns }}/$IMAGE"
+          podman manifest create "$repo:latest" \
+            "docker://$repo:amd64" \
+            "docker://$repo:arm64"
+          podman manifest push --all "$repo:latest" "docker://$repo:latest"

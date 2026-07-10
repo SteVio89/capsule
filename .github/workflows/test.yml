@@ -1,0 +1,16 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck ships preinstalled on GitHub's ubuntu runners.
+      - run: shellcheck bin/capsule test/capsule-test.sh
+      - run: bash test/capsule-test.sh

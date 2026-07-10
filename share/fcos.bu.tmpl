@@ -1,0 +1,22 @@
+variant: fcos
+version: 1.5.0
+passwd:
+  users:
+    - name: core
+      groups: [ sudo, wheel ]
+      ssh_authorized_keys:
+        - "@SSH_KEY@"
+storage:
+  files:
+    - path: /var/lib/systemd/linger/core
+      contents: { inline: "" }
+    - path: /etc/sysctl.d/99-rootless.conf
+      contents:
+        inline: |
+          net.ipv4.ip_unprivileged_port_start=80
+  links:
+    # Ignition cannot enable *user* units, and a link under ~/.config silently fails
+    # because Ignition creates the parent dirs as root. /etc/systemd/user applies to
+    # every user manager and needs no ownership fixup. linger starts it at boot.
+    - path: /etc/systemd/user/sockets.target.wants/podman.socket
+      target: /usr/lib/systemd/user/podman.socket
