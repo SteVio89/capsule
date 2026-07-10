@@ -19,4 +19,4 @@ lint:
     zig fmt --check src build.zig
 
 clean:
-    rm -rf zig-out .zig-cache
+    rm -rf zig-out zig-pkg .zig-cache
