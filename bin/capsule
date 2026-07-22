@@ -172,6 +172,21 @@ need_fetched() {
     || die "no vm/$CAPSULE_BRANCH — run 'capsule fetch' first"
 }
 
+# The branch we treat as "main" for the post-merge replica re-sync. Only a merge into it
+# re-syncs the replica; merging into a feature branch shouldn't move the agent's base.
+# Prefer the remote's default (origin/HEAD), fall back to main/master, else the current
+# branch (so the guard is a no-op in a repo with none). Override with CAPSULE_MAIN_BRANCH.
+default_branch() {
+  local d
+  if d=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); then
+    echo "${d#origin/}"; return
+  fi
+  for d in main master; do
+    if git show-ref --verify --quiet "refs/heads/$d"; then echo "$d"; return; fi
+  done
+  git rev-parse --abbrev-ref HEAD
+}
+
 cmd_push()   { host_only push;   need_remote; git push vm "HEAD:$CAPSULE_BRANCH"; }
 cmd_fetch()  { host_only fetch;  need_remote; git fetch vm; }
 cmd_review() { host_only review; need_fetched; git log -p --reverse "HEAD..vm/$CAPSULE_BRANCH"; }
@@ -197,6 +212,24 @@ cmd_merge() {
   echo
   [[ $ans == [yY] ]] || { echo "aborted"; return 1; }
   git merge --no-ff "vm/$CAPSULE_BRANCH"
+
+  # Re-sync the replica so the agent's next run is based on this merge, not the stale tip
+  # it committed on — otherwise a long-lived container keeps re-basing on old state and
+  # never sees host-side changes. The merge commit descends from vm/$CAPSULE_BRANCH, so
+  # this push is a fast-forward; receive.denyCurrentBranch=updateInstead then advances the
+  # replica's mounted working tree in place. Best-effort: the merge is already committed,
+  # so a rejected push (agent's tree dirty mid-task, or the replica advanced past what we
+  # merged) must warn, never fail. Guarded to the default branch so merging into a feature
+  # branch doesn't move the agent's base.
+  local main_branch="${CAPSULE_MAIN_BRANCH:-$(default_branch)}"
+  if [[ $here != "$main_branch" ]]; then
+    echo "on '$here' (not '$main_branch') — replica left as is; 'capsule push' to sync it"
+  elif git push vm "HEAD:$CAPSULE_BRANCH"; then
+    echo "replica synced — vm/$CAPSULE_BRANCH now at the merge"
+  else
+    echo "capsule: merged, but the replica wasn't synced (agent tree busy, or ahead of" >&2
+    echo "         what we merged). run 'capsule push' once the agent is idle." >&2
+  fi
 }
 
 # ---------------------------------------------------------------- capsule
@@ -428,7 +461,7 @@ ${b}handoff${r}   (host only)
   ${d}push${r}                git push vm HEAD:$CAPSULE_BRANCH
   ${d}fetch${r}               git fetch vm — refs only, nothing else changes
   ${d}review${r}              show every commit and patch waiting in vm/$CAPSULE_BRANCH
-  ${d}merge${r}               diffstat, confirm, merge --no-ff
+  ${d}merge${r}               diffstat, confirm, merge --no-ff, re-sync the replica
 
 EOF
 }
