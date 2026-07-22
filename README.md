@@ -125,7 +125,18 @@ capsule merge              # diffstat, confirm, merge --no-ff
 | `push` | `git push vm HEAD:capsule` |
 | `fetch` | `git fetch vm` — refs only |
 | `review` | show every commit and patch waiting in `vm/capsule` |
-| `merge` | diffstat, confirm, `merge --no-ff` |
+| `merge` | diffstat, confirm, `merge --no-ff`, then re-sync the replica |
+
+After a `merge` into your default branch, `capsule` pushes the result back to the
+replica so the agent's next run is based on the merge, not the stale tip it
+committed on — handy when you keep a container open and just restart the agent.
+The push is a fast-forward and `updateInstead` advances the replica's working
+tree in place. It's best-effort: if the agent's tree is dirty mid-task (or the
+replica has moved ahead of what you merged) the push is skipped with a note to
+run `capsule push` when the agent is idle. Merges into any other branch leave the
+replica untouched. Override which branch counts as "default" with
+`CAPSULE_MAIN_BRANCH` (otherwise it's auto-detected from `origin/HEAD`, then
+`main`/`master`).
 
 ## Configuration
 
@@ -140,6 +151,7 @@ knobs:
 | `CAPSULE_VM_PORT` | `2222` | ssh port |
 | `CAPSULE_IMAGE` | `ghcr.io/stevio89/capsule:latest` | container image |
 | `CAPSULE_BRANCH` | `capsule` | branch the agent commits on |
+| `CAPSULE_MAIN_BRANCH` | auto-detected | branch whose merge re-syncs the replica |
 | `CAPSULE_VM_CPUS` / `CAPSULE_VM_MEM` | `4` / `6144` | VM resources |
 | `CAPSULE_DISK_SIZE` | `80G` | VM disk size |
 
