@@ -14,6 +14,15 @@ storage:
       contents:
         inline: |
           net.ipv4.ip_unprivileged_port_start=80
+    # This VM has no RTC and QEMU user-net brings the network up late, so chrony
+    # can exhaust its default 3-update step allowance before it reaches a source
+    # and then refuses to jump a large offset (it only slews). Allow it to step
+    # on any update. confdir is chrony.conf's last line, so this wins over the
+    # default `makestep 1.0 3`.
+    - path: /etc/chrony.d/90-capsule-makestep.conf
+      contents:
+        inline: |
+          makestep 1.0 -1
   links:
     # Ignition cannot enable *user* units, and a link under ~/.config silently fails
     # because Ignition creates the parent dirs as root. /etc/systemd/user applies to

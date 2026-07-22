@@ -38,6 +38,13 @@ container mounted on the project. Per-agent state (`~/.claude`, cursor config)
 is kept per *profile*, so `capsule shell work` and `capsule shell experiment`
 don't share logins or history.
 
+Your git identity comes along for free: `capsule shell` copies your host's
+`user.name` / `user.email` to the VM (once — a VM-side identity you set by hand
+wins), and the VM's `~/.gitconfig` is mounted read-only into every container. So
+the agent's commits are attributed to you without any per-container `git config`.
+Only name and email cross over — not the whole host config, whose commit signing
+or credential helpers would only break the agent's commits inside the container.
+
 ## Requirements
 
 - [Nix](https://nixos.org/download) with flakes, and [direnv](https://direnv.net) — for the devshell commands
