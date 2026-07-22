@@ -201,6 +201,23 @@ cmd_merge() {
 
 # ---------------------------------------------------------------- capsule
 
+# Seed the VM's git identity from the host, so the container's mounted ~/.gitconfig has a
+# user.name/email to commit with — set once here, not once per container. Only name/email
+# cross over, never the whole host config: a host-side gpgsign or an osxkeychain credential
+# helper would just make the agent's commits fail inside the container. A git identity
+# already set on the VM wins (so `capsule ssh git config --global ...` is never clobbered),
+# and a host with no identity is a silent no-op.
+seed_git_identity() {
+  local name email
+  name=$(git config --get user.name 2>/dev/null || true)
+  email=$(git config --get user.email 2>/dev/null || true)
+  [[ -n $name || -n $email ]] || return 0
+  name=${name//\'/\'\\\'\'}; email=${email//\'/\'\\\'\'}   # single-quote-safe for the remote
+  ssh_vm "git config --global --get user.email >/dev/null 2>&1 && exit 0; \
+          [ -n '$name' ]  && git config --global user.name  '$name'; \
+          [ -n '$email' ] && git config --global user.email '$email'; :"
+}
+
 cmd_shell() {
   host_only shell
   local profile="${1:-default}"
@@ -223,12 +240,22 @@ cmd_shell() {
     git -C "$proj" push -q vm "HEAD:$CAPSULE_BRANCH"
   fi
 
+  seed_git_identity
+
   printf '\n  capsule  profile=%s  project=%s\n\n' "$profile" "$name"
 
   local h="$CAPSULE_CONTAINER_HOME"
+  # The agent's git identity (user.name / user.email, aliases, …) comes from the VM's
+  # ~/.gitconfig, mounted read-only — so it's set once per VM, not once per container.
+  # home-manager writes the container's managed config to ~/.config/git/config (XDG),
+  # so ~/.gitconfig layers on top and its safe.directory=* survives. Set it once with
+  # `capsule ssh git config --global user.email ...`. The mount is added only when the
+  # VM actually has a ~/.gitconfig, else podman would create an empty dir in its place.
   exec ssh -t -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST" \
     "mkdir -p ~/.capsule/$profile/claude ~/.capsule/$profile/cursor ~/.capsule/cache \
-     && cd ~/$name && podman run --rm -it \
+     && cd ~/$name || exit 1 ; \
+     git_mount=\$([ -f \"\$HOME/.gitconfig\" ] && echo \"-v \$HOME/.gitconfig:$h/.gitconfig:ro\") ; \
+     podman run --rm -it \
        --security-opt label=disable \
        -e DOCKER_HOST=unix:///run/podman.sock \
        -e TESTCONTAINERS_RYUK_DISABLED=true \
@@ -239,6 +266,7 @@ cmd_shell() {
        -v ~/.capsule/cache:$h/.cache \
        -v ~/.capsule/$profile/claude:$h/.claude \
        -v ~/.capsule/$profile/cursor:$h/.config/cursor \
+       \$git_mount \
        -v \"\$PWD:\$PWD\" -w \"\$PWD\" \
        $CAPSULE_IMAGE"
 }
@@ -360,6 +388,7 @@ cmd_vm() {
   echo "capsule: booting VM (${CAPSULE_VM_CPUS} cpu, ${CAPSULE_VM_MEM}M, ssh on :${CAPSULE_VM_PORT})"
   exec "$qemu" \
     -machine virt,accel=hvf -cpu host \
+    -rtc base=utc,clock=host \
     -smp "$CAPSULE_VM_CPUS" -m "$CAPSULE_VM_MEM" \
     -nographic \
     -bios "$fw" \
