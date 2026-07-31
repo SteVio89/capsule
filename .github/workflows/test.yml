@@ -12,5 +12,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # shellcheck ships preinstalled on GitHub's ubuntu runners.
-      - run: shellcheck bin/capsule test/capsule-test.sh
+      - run: shellcheck bin/capsule test/capsule-test.sh test/capsuled-test.sh
+      # The scripts seeded into the agent's home are POSIX sh, not bash.
+      - run: shellcheck -s sh src/assets/hooks/*.sh src/assets/statusline.sh
       - run: bash test/capsule-test.sh
+
+  # Separate from `check` so the bash job stays fast and needs nothing installed.
+  #
+  # Everything runs through `nix develop` rather than a setup-zig action: that proves the
+  # *pinned* zig_0_16 from the committed flake.lock is the toolchain that compiles, which
+  # is the whole point of pinning it.
+  zig:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to a release tag: @main hands whoever controls that repo's default branch
+      # arbitrary code execution in this CI on their schedule, not ours.
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - run: nix develop --command zig fmt --check src build.zig
+      - run: nix develop --command zig build test
+      - run: nix develop --command sh -c 'zig build && bash test/capsuled-test.sh'
+      # Also exercises zigCheckPhase, which runs the tests again inside the sandbox and
+      # catches the "works in the devshell, breaks in the derivation" class.
+      - run: nix build .#capsuled

@@ -1,0 +1,17 @@
+.{
+    .name = .capsuled,
+    .version = "0.1.0",
+    .fingerprint = 0xecaef0f7c4fda351, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+
+    // Deliberately empty, and worth keeping that way. Any entry here forces the Nix build
+    // through `zig.fetchDeps` — a fixed-output derivation with a hash to regenerate on
+    // every bump. sqlite comes from the system, the TUI is hand-rolled ANSI.
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
