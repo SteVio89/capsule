@@ -67,7 +67,9 @@
                     with pkgs;
                     # fzf is a hard dependency: every command that takes an id also accepts
                     # none and opens a picker instead.
-                    [ git curl jq fzf coreutils gnused gawk gnutar gzip findutils ]
+                    # tuicr is what `run review` opens; without it the command falls
+                    # back to `git log -p`.
+                    [ git curl jq fzf tuicr coreutils gnused gawk gnutar gzip findutils ]
                     ++ [ self.packages.${system}.capsuled ]
                     ++ lib.optionals stdenv.isDarwin [ qemu butane xz ]
                   )
@@ -128,7 +130,7 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              shellcheck butane qemu jq fzf
+              shellcheck butane qemu jq fzf tuicr
               zig_0_16 zls pkg-config
             ];
             buildInputs = [ pkgs.sqlite ];

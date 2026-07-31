@@ -659,7 +659,29 @@ cmd_run_review() {
   git rev-parse --verify -q "vm/$branch" >/dev/null \
     || die "the replica has no $branch — has this issue been dispatched?"
 
-  git log -p --reverse "HEAD..vm/$branch"
+  # tuicr reviews the range like a PR — inline comments, no GitHub needed. The plain-git
+  # fallback covers the symlink install (no wrapped PATH) and a redirected stdout, where
+  # the caller wants text, not a TUI.
+  if ! command -v tuicr >/dev/null 2>&1 || [[ ! -t 1 ]]; then
+    git log -p --reverse "HEAD..vm/$branch"
+    return
+  fi
+
+  # With --stdout the TUI renders on the tty and stdout carries only what `y` exports,
+  # so the substitution captures the review markdown and nothing else.
+  local exported
+  exported=$(tuicr --no-update-check --stdout -r "HEAD..vm/$branch")
+  if [[ -z $exported ]]; then
+    echo "${_d}no comments exported — press y in tuicr to hand them back to the issue${_r}"
+    return 0
+  fi
+
+  printf '%s\n\n' "$exported"
+  local ans
+  read -r -n1 -p "attach to the issue for the agent's next run? [y/N] " ans < /dev/tty; echo
+  [[ $ans == [yY] ]] || { echo "not attached"; return 0; }
+  capsuled issue.comment "$(project_params),\"id\":$(json_string "$issue"),\"text\":$(json_string "$exported")}" \
+    && echo "attached"
 }
 
 cmd_run_merge() {
@@ -1309,7 +1331,7 @@ ${_b}capsule run${_r} — hand work to an agent and take it back
   ${_d}list${_r}                runs on this project, newest first
   ${_d}push${_r} [issue-id]     push HEAD onto that issue's branch in the replica
   ${_d}fetch${_r}               git fetch vm — refs only, nothing else changes
-  ${_d}review${_r} [issue-id]   every commit and patch waiting on that issue's branch
+  ${_d}review${_r} [issue-id]   review that issue's branch in tuicr (git log -p without it)
   ${_d}merge${_r} [issue-id]    squash into this branch, mark the issue done, re-sync
 
 EOF

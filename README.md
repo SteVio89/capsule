@@ -55,7 +55,9 @@ or credential helpers would only break the agent's commits inside the container.
 ## Requirements
 
 - [Nix](https://nixos.org/download) with flakes, and [direnv](https://direnv.net) — for the devshell commands
-- git, ssh, [fzf](https://github.com/junegunn/fzf), [jq](https://jqlang.github.io/jq/) — the Nix package wires fzf and jq in for you
+- git, ssh, [fzf](https://github.com/junegunn/fzf), [jq](https://jqlang.github.io/jq/),
+  [tuicr](https://tuicr.dev) — the Nix package wires fzf, jq and tuicr in for you.
+  tuicr is what `run review` opens; without it the command falls back to `git log -p`
 - **`capsule vm start` only** (Apple Silicon host): qemu, butane, xz, jq, curl.
   The Nix package wires these into `PATH` for you.
 
@@ -97,7 +99,7 @@ capsule run start          # pick the issue; replica is bootstrapped on first ru
 #   ...agent works, commits on `capsule/<issue-id>`...
 
 # 4. bring the work back
-capsule run review         # every commit + patch waiting on the issue's branch
+capsule run review         # the issue's branch, PR-style in tuicr
 capsule run merge          # diffstat, confirm, squash-merge as one commit
 ```
 
@@ -230,8 +232,17 @@ a container where there is no socket to talk to.
 | `run list` | the project's runs and their states |
 | `run push [issue]` | `git push vm HEAD:capsule/<issue-id>` |
 | `run fetch` | `git fetch vm` — refs only |
-| `run review [issue]` | show every commit and patch waiting on the issue's branch |
+| `run review [issue]` | review the issue's branch in [tuicr](https://tuicr.dev), PR-style |
 | `run merge [issue]` | diffstat, confirm, **squash-merge** as one commit, mark the issue done |
+
+`run review` opens the branch in [tuicr](https://tuicr.dev) — the whole diff as one
+PR-style buffer, with inline comments. Reviewing a revision range needs no GitHub
+and no shared remote, so it works on the replica's branches as-is. When the work
+isn't ready to merge, leave comments and press `y`: on exit, capsule shows what
+you exported and offers to attach it to the issue, where the agent sees it on its
+next run. Attaching is a confirmed step, never implicit — quitting without
+exporting changes nothing. Without tuicr on `PATH` (or with stdout redirected)
+the command falls back to `git log -p`.
 
 The merge is a squash, not `--no-ff`: one commit with a message you author lands
 on your branch, and the agent's granular commits stay out of your history.
