@@ -1,9 +1,4 @@
 //! Memory: the cap, and staleness.
-//!
-//! A small curated set of things a fresh agent could not work out from the code, the
-//! issue, or the branch. Not derived from the event log — summarising events into
-//! memories produces plausible accumulation that decays invisibly, and makes the log's
-//! honesty pointless because the derived layer is what gets read.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -46,9 +41,6 @@ pub const Outcome = union(enum) {
 };
 
 /// Pure: the current active count and a buffer's verbs in, applied or refused out.
-///
-/// Deactivations in the same buffer count, which is the point — you may add at the cap,
-/// but only by making room in the same pass.
 pub fn applyCap(active_now: usize, decisions: []const Decision) Outcome {
     var activating: usize = 0;
     var freeing: usize = 0;
@@ -65,10 +57,6 @@ pub fn applyCap(active_now: usize, decisions: []const Decision) Outcome {
 
 /// Rough, and labelled as such wherever it is shown. There is no tokeniser here and
 /// pulling one in for a soft warning would be absurd.
-///
-/// What this actually detects is verbosity, since the hard cap already governs count: a
-/// good memory is one to three sentences, roughly 30-60 tokens, so forty of them is about
-/// 2,000. Crossing 3,000 means they have grown into documentation.
 pub fn estimateTokens(bodies: []const []const u8) usize {
     var bytes: usize = 0;
     for (bodies) |body| bytes += body.len;
@@ -82,13 +70,6 @@ pub fn overBudget(bodies: []const []const u8) bool {
 }
 
 /// A memory is suspect when a path it is anchored to has been deleted or renamed.
-///
-/// **Deleted or renamed only — never modified.** File deletion is unambiguous; "changed
-/// substantially" is a judgement that produces noisy flags nobody trusts, and a flag
-/// nobody trusts is worse than no flag. Start strict so every flag is real.
-///
-/// No TTLs anywhere: they are arbitrary and get ignored. Staleness is a fact about the
-/// code, not about the clock.
 pub fn isSuspect(anchors: []const u8, gone: []const []const u8) bool {
     var lines = std.mem.splitScalar(u8, anchors, '\n');
     while (lines.next()) |raw| {
@@ -113,8 +94,6 @@ pub fn anchorCount(anchors: []const u8) usize {
     return n;
 }
 
-// ---------------------------------------------------------------- tests
-
 const testing = std.testing;
 
 fn plan(comptime verbs: []const Verb) [verbs.len]Decision {
@@ -129,7 +108,6 @@ test "under the cap, activations apply" {
 }
 
 test "accepting at exactly the cap is refused" {
-    // The named boundary case: 40 active, one more proposed, nothing freed.
     const d = plan(&.{.activate});
     switch (applyCap(active_cap, &d)) {
         .refused => |r| try testing.expectEqual(active_cap + 1, r.would_be),
@@ -138,8 +116,6 @@ test "accepting at exactly the cap is refused" {
 }
 
 test "accepting at the cap is allowed when the same buffer frees a slot" {
-    // This is the whole mechanism: you may add, but only by arguing the new one beats
-    // an existing one — in the same pass, where both are in front of you.
     const d = plan(&.{ .activate, .deactivate });
     try testing.expectEqual(Outcome.applied, applyCap(active_cap, &d));
 }
@@ -156,7 +132,6 @@ test "two activations need two deactivations" {
 }
 
 test "discarding does not free a slot, because it was never taking one" {
-    // discard is proposed → inactive; the proposal was never active.
     switch (applyCap(active_cap, &plan(&.{ .activate, .discard }))) {
         .refused => {},
         .applied => return error.ShouldHaveRefused,
@@ -173,12 +148,10 @@ test "an empty buffer changes nothing, even at the cap" {
 }
 
 test "the token budget is a warning about verbosity, not about count" {
-    // Forty memories of one to three sentences sit comfortably inside it.
     var short: [active_cap][]const u8 = undefined;
     for (&short) |*body| body.* = "X not Y, because Z. It bit us once already.";
     try testing.expect(!overBudget(&short));
 
-    // The same count, grown into documentation, does not.
     var long: [active_cap][]const u8 = undefined;
     for (&long) |*body| body.* = "x" ** 400;
     try testing.expect(overBudget(&long));
@@ -188,7 +161,6 @@ test "a memory is suspect only when an anchor is gone" {
     try testing.expect(isSuspect("src/limit.zig\ntest/run.sh", &.{"src/limit.zig"}));
     try testing.expect(!isSuspect("src/limit.zig", &.{"src/other.zig"}));
     try testing.expect(!isSuspect("src/limit.zig", &.{}));
-    // A memory with no anchor is project-wide and is never flagged this way.
     try testing.expect(!isSuspect("", &.{"anything"}));
 }
 

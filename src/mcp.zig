@@ -1,20 +1,4 @@
 //! The MCP surface: five tools, and the JSON-RPC framing around them.
-//!
-//! Minimal on purpose. Every tool definition costs context on every turn, forever, so the
-//! set is exactly what an agent working one issue needs and nothing else.
-//!
-//! **The tool descriptions carry the behavioural instructions**, not just parameter docs.
-//! Tool definitions are re-sent to the model every turn and never compact away, which
-//! makes them the one place an instruction is durable for free — unlike a start-of-session
-//! file, which sits precisely in the region long sessions summarise out.
-//!
-//! There is no `list_ready`: the session is locked to one issue and cannot switch, so a
-//! standing list would cost tokens every turn to show work the agent cannot act on. The
-//! one real benefit — not filing duplicates — is delivered by `file_issue`'s *response*,
-//! at the only moment it matters and at no cost on turns where nothing is filed.
-//!
-//! And there is deliberately no description-write tool and no route to `open`, `done`, or
-//! `archived`. Descriptions and lifecycle decisions are human-authored.
 
 const std = @import("std");
 
@@ -130,8 +114,6 @@ pub fn findTool(name: []const u8) ?Tool {
     return null;
 }
 
-// ---------------------------------------------------------------- request framing
-
 pub const Request = struct {
     /// Absent for notifications, which take no response at all.
     id: ?std.json.Value,
@@ -244,8 +226,6 @@ pub fn negotiateVersion(params: std.json.Value) []const u8 {
     };
 }
 
-// ---------------------------------------------------------------- tests
-
 const testing = std.testing;
 
 fn testArena() std.heap.ArenaAllocator {
@@ -253,12 +233,10 @@ fn testArena() std.heap.ArenaAllocator {
 }
 
 test "there are exactly five tools, and they are the specified five" {
-    // The count is the point: every definition is re-sent every turn, forever.
     try testing.expectEqual(@as(usize, 5), tools.len);
     for ([_][]const u8{ "get_issue", "set_state", "comment", "file_issue", "propose_memory" }) |name| {
         try testing.expect(findTool(name) != null);
     }
-    // Deliberately absent — see the module header for why each one is missing.
     for ([_][]const u8{ "list_ready", "set_description", "read_file", "run_command", "search_memory" }) |name| {
         try testing.expect(findTool(name) == null);
     }
@@ -268,13 +246,11 @@ test "set_state cannot reach a state the agent may not set" {
     const tool = findTool("set_state").?;
     try testing.expect(std.mem.indexOf(u8, tool.schema, "in_progress") != null);
     try testing.expect(std.mem.indexOf(u8, tool.schema, "ready_for_review") != null);
-    // Merging is a human decision; the enum is what enforces that at the boundary.
     try testing.expect(std.mem.indexOf(u8, tool.schema, "\"done\"") == null);
     try testing.expect(std.mem.indexOf(u8, tool.schema, "\"archived\"") == null);
 }
 
 test "the descriptions carry the behaviour, not just the parameters" {
-    // These are load-bearing: they are the only instructions that survive compaction.
     try testing.expect(std.mem.indexOf(u8, findTool("get_issue").?.description, "Call this first") != null);
     try testing.expect(std.mem.indexOf(u8, findTool("set_state").?.description, "REQUIRED") != null);
     try testing.expect(std.mem.indexOf(u8, findTool("file_issue").?.description, "similar") != null);
@@ -293,8 +269,6 @@ test "every tool's schema is valid json" {
 }
 
 test "get_issue takes no arguments at all" {
-    // The token supplies project and issue, so there is nothing to pass and nothing to
-    // get wrong.
     const tool = findTool("get_issue").?;
     try testing.expect(std.mem.indexOf(u8, tool.schema, "\"properties\":{}") != null);
 }
@@ -371,7 +345,6 @@ test "the tool list is well-formed json with every tool in it" {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a.allocator(), w.buffered(), .{});
     const listed = parsed.object.get("result").?.object.get("tools").?.array;
     try testing.expectEqual(tools.len, listed.items.len);
-    // The schema must arrive as an object, not as the string we stored it as.
     try testing.expect(listed.items[0].object.get("inputSchema").? == .object);
 }
 

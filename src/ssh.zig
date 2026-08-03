@@ -1,12 +1,5 @@
 //! The daemon's ssh: the ControlMaster it owns, the reverse tunnel it holds open, and the
 //! one batched probe it runs on a timer.
-//!
-//! `bin/capsule` also multiplexes over the master, but with `ControlMaster=auto` and no
-//! `-M`, so bash works identically whether or not this process is running. Nothing in the
-//! CLI depends on the daemon for ssh.
-//!
-//! The argv builders are pure and carry the tests. The `ssh` calls themselves are not
-//! unit-testable and are deliberately not mocked — a mocked ssh would only prove the mock.
 
 const std = @import("std");
 const world = @import("world.zig");
@@ -63,14 +56,6 @@ pub fn controlArgs(arena: std.mem.Allocator, cfg: Config, verb: []const u8) ![]c
 /// The reverse tunnel gets its own ssh process rather than riding the master with
 /// `-O forward`: a master restart silently drops a multiplexed forward, and a tunnel that
 /// is quietly gone is worse than one that visibly died.
-///
-/// Bound to the VM's loopback, never `0.0.0.0`. With CAPSULE_VM_HOST pointing at a real
-/// machine on a LAN, `GatewayPorts yes` would put the MCP endpoint on that network —
-/// token-gated but reachable, which is exactly what "local only" forbids. The container
-/// sees this loopback because it runs with `--network=host`.
-///
-/// `ExitOnForwardFailure=yes` so a stale forward from a previous run fails loudly here
-/// instead of leaving a tunnel that accepts nothing.
 pub fn tunnelArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     var args: std.ArrayList([]const u8) = .empty;
     try args.append(arena, "ssh");
@@ -90,10 +75,6 @@ pub fn tunnelArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
 }
 
 /// Starts the reverse tunnel as a detached child and hands back the handle.
-///
-/// Owned by the daemon, not by `run start`: a run's CLI exits long before the container
-/// does, so a tunnel tied to it would be gone while the agent was still working. One
-/// tunnel for the VM's lifetime, shared by every run, disambiguated by the token.
 pub fn startTunnel(arena: std.mem.Allocator, io: std.Io, cfg: Config) !std.process.Child {
     return std.process.spawn(io, .{
         .argv = try tunnelArgs(arena, cfg),
@@ -104,7 +85,6 @@ pub fn startTunnel(arena: std.mem.Allocator, io: std.Io, cfg: Config) !std.proce
 }
 
 /// Wraps `text` in single quotes for a POSIX shell, escaping embedded single quotes.
-/// Returns an arena-allocated string that expands to exactly `text`, whatever it holds.
 pub fn shellQuote(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.append(arena, '\'');
@@ -116,11 +96,6 @@ pub fn shellQuote(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 /// One call per tick, not one per fact. Returns the arena-allocated ssh argv.
-///
-/// The probe script rides in the remote command itself — ssh hands the remote shell one
-/// flat string, so the here-doc arrives verbatim. It must not go via `sh -s` on stdin:
-/// `std.process.run` pins stdin to /dev/null, and a probe that reads its script from an
-/// empty stdin "succeeds" with no output, which reads as a VM with nothing running on it.
 pub fn probeArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     var args: std.ArrayList([]const u8) = .empty;
     try args.append(arena, "ssh");
@@ -149,9 +124,6 @@ pub fn probe(
 ) world.Snapshot {
     const argv = probeArgs(arena, cfg) catch return .{};
 
-    // A timeout is not optional here. ssh to a host that is off, or behind a name that
-    // does not resolve, blocks for a long time — and a poll tick that never returns is a
-    // poll thread that never ticks again.
     const result = std.process.run(gpa, io, .{
         .argv = argv,
         .stdout_limit = .limited(1 << 20),
@@ -168,8 +140,6 @@ pub fn probe(
     const copy = arena.dupe(u8, result.stdout) catch return .{};
     return world.parseProbe(arena, copy, now_ms) catch .{};
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -214,8 +184,6 @@ test "the tunnel binds the VM's loopback and never every interface" {
     defer a.deinit();
     const line = try joined(a.allocator(), try tunnelArgs(a.allocator(), test_cfg));
     try testing.expect(std.mem.indexOf(u8, line, "127.0.0.1:8765:localhost:8765") != null);
-    // The two ways to get this wrong, both of which would put the endpoint on a LAN when
-    // CAPSULE_VM_HOST is a real machine.
     try testing.expect(std.mem.indexOf(u8, line, "0.0.0.0") == null);
     try testing.expect(std.mem.indexOf(u8, line, "GatewayPorts") == null);
 }
@@ -243,9 +211,6 @@ test "the probe carries the image so the digest can be compared" {
 }
 
 test "the probe script itself travels in the remote command" {
-    // Regression: the script used to be addressed to `sh -s`, whose stdin the daemon
-    // never wrote. The remote shell read EOF, ran nothing, and exited 0 — an empty
-    // "success" that made reconcile abandon every live run within one poll tick.
     var a = testArena();
     defer a.deinit();
     const line = try joined(a.allocator(), try probeArgs(a.allocator(), test_cfg));

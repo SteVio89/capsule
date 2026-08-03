@@ -1,26 +1,10 @@
 //! The daemon's model of the world: VM up, disk, containers, branches, image freshness.
-//!
-//! Refreshed by one batched ssh call on a slow timer. Not five calls — even multiplexed,
-//! five is five times the syscalls and five times the failure surface for facts that are
-//! always read together.
-//!
-//! Every fact carries the time it was observed. A dashboard that cannot say how old its
-//! numbers are is worse than one showing nothing, because it looks current.
-//!
-//! `parseProbe` is pure and is where the testing happens; the ssh call around it is not
-//! unit-testable and is not mocked.
 
 const std = @import("std");
 
 /// One `key<TAB>value` line per fact. The script travels inside the ssh remote command
 /// (see `ssh.probeArgs`) and the daemon parses its output — a shape both sides can be
 /// read and checked by eye, which matters more here than compactness.
-///
-/// The branch count is commits *waiting*: reachable from the `capsule/*` branch but from
-/// no other local branch. Counting the whole history would show thousands of "waiting"
-/// commits on a mature repo the moment a run starts. The base is every non-capsule
-/// branch rather than a hardcoded `main` because the replica's default branch is whatever
-/// the host pushed, under whatever name the host repo uses.
 pub const probe_script =
     \\printf 'uptime\t%s\n' "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     \\df -P / | awk 'NR==2 {printf "disk_used\t%s\ndisk_total\t%s\n", $3*1024, $2*1024}'
@@ -63,8 +47,6 @@ pub const Snapshot = struct {
     branches: []const Branch = &.{},
 
     /// Frees the container and branch slices and resets to the unreachable default.
-    /// `gpa` must be the allocator `parseProbe` filled them from; the strings they held
-    /// point into that same allocation and die with it.
     pub fn deinit(s: *Snapshot, gpa: std.mem.Allocator) void {
         gpa.free(s.containers);
         gpa.free(s.branches);
@@ -106,9 +88,6 @@ pub fn parseProbe(arena: std.mem.Allocator, blob: []const u8, observed_at_ms: i6
             const project = fields.next() orelse continue;
             const name = fields.next() orelse continue;
             const commits = parseU64(fields.next()) orelse continue;
-            // Names cross into JSON responses verbatim, and anything in the VM can mint
-            // a branch name. Non-UTF-8 is dropped here, at the door, rather than being
-            // trusted to render or encode cleanly later.
             if (!std.unicode.utf8ValidateSlice(project) or !std.unicode.utf8ValidateSlice(name)) continue;
             try branches.append(arena, .{ .project = project, .name = name, .commits = commits });
         }
@@ -123,8 +102,6 @@ fn parseU64(text: ?[]const u8) ?u64 {
     const t = text orelse return null;
     return std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch null;
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -187,7 +164,6 @@ test "malformed lines are skipped, not fatal" {
     try testing.expectEqual(@as(?u64, null), s.uptime_s);
     try testing.expectEqual(@as(usize, 0), s.containers.len);
     try testing.expectEqual(@as(usize, 0), s.branches.len);
-    // The one good fact after all that noise still lands.
     try testing.expectEqual(@as(u64, 42), s.disk_used.?);
 }
 

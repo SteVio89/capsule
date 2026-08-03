@@ -1,9 +1,4 @@
 //! `$VISUAL` / `$EDITOR` writeback, git-style: spawn on a temp file, wait, inspect.
-//!
-//! Built once and called from all four sites — issue descriptions, comments, squash merge
-//! messages, and the triage/memory buffers. Written inline four times it would behave four
-//! slightly different ways, and the "unchanged means no-op" rule is the one that matters
-//! most and is easiest to get subtly wrong.
 
 const std = @import("std");
 const Io = std.Io;
@@ -11,7 +6,6 @@ const Io = std.Io;
 /// What the user did, in the order the checks must happen.
 pub const Outcome = enum {
     /// Opened and closed without changing anything — the common case, someone reading.
-    /// Writes no event: getting this wrong makes the event log useless.
     unchanged,
     /// Emptied the buffer. Git's convention for "cancel", and the only intuitive one once
     /// you are already inside the editor.
@@ -36,8 +30,6 @@ pub fn classify(before: []const u8, after: []const u8, exit_code: u8) Outcome {
 /// Context headers use HTML comments, not `#`: the buffer is markdown, where `#` is a
 /// heading and would end up in the issue body.
 pub fn stripComments(text: []const u8) []const u8 {
-    // Only leading comment lines are stripped in place; the general case allocates, so
-    // callers that need that use `stripCommentsAlloc`.
     var rest = text;
     while (std.mem.startsWith(u8, rest, "<!--")) {
         const end = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
@@ -73,14 +65,6 @@ pub const Result = struct {
 };
 
 /// Spawns the editor on a temp file seeded with `seed`, waits, and classifies the result.
-///
-/// The file is named `.md` so editors turn on markdown highlighting and spell-check —
-/// these buffers are prose, and the difference in the writing is noticeable.
-///
-/// The file is created exclusively, mode 0600, under a random name. Issue bodies pass
-/// through here, `tmp_dir` may be a shared /tmp, and a predictable world-readable name
-/// is both a disclosure and a symlink target — exclusive create refuses a pre-planted
-/// path instead of writing through it.
 pub fn editText(
     arena: std.mem.Allocator,
     io: Io,
@@ -116,8 +100,6 @@ pub fn editText(
     }
 
     const editor = resolveEditor(environ);
-    // Through a shell, because $EDITOR is conventionally a command line rather than a
-    // path — "code --wait", "emacsclient -nw" and friends all have arguments.
     var child = try std.process.spawn(io, .{
         .argv = &.{ "sh", "-c", try std.fmt.allocPrint(arena, "{s} \"$1\"", .{editor}), "sh", path },
         .stdin = .inherit,
@@ -130,9 +112,6 @@ pub fn editText(
         else => 1,
     };
 
-    // A failed read-back is an error, never "aborted": classifying it as an abort would
-    // silently delete text the user just wrote. The file is kept and named so the text
-    // survives the failure.
     const after = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err| {
         keep_for_recovery = true;
         std.log.err("could not read the edited buffer back ({t}) — your text is still at {s}", .{ err, path });
@@ -145,8 +124,6 @@ pub fn editText(
     };
 }
 
-// ---------------------------------------------------------------- tests
-
 const testing = std.testing;
 
 test "a non-zero exit discards, whatever the buffer says" {
@@ -155,7 +132,6 @@ test "a non-zero exit discards, whatever the buffer says" {
 }
 
 test "an untouched buffer is unchanged, not a write" {
-    // The common case: opened to read. Writing an event here would make the log useless.
     try testing.expectEqual(Outcome.unchanged, classify("body text\n", "body text\n", 0));
     try testing.expectEqual(Outcome.unchanged, classify("body text", "body text\n", 0));
 }
@@ -170,14 +146,12 @@ test "a real edit is a change" {
 }
 
 test "quitting without saving exits zero, so the hash is what catches it" {
-    // `:q!` returns 0 and leaves the file alone. Exit code alone would call this a change.
     try testing.expectEqual(Outcome.unchanged, classify("seeded\n", "seeded\n", 0));
 }
 
 test "a context header does not count as content" {
     const seed = "<!-- capsule: edit the body below -->\nreal body\n";
     try testing.expectEqual(Outcome.unchanged, classify(seed, seed, 0));
-    // Deleting everything but the header is still an abort, not a body of one comment.
     try testing.expectEqual(Outcome.aborted, classify(seed, "<!-- capsule: edit the body below -->\n", 0));
 }
 
@@ -202,7 +176,6 @@ test "editor resolution prefers VISUAL, then EDITOR, then vi" {
     try testing.expectEqualStrings("nano", resolveEditor(&map));
     try map.put("VISUAL", "hx");
     try testing.expectEqualStrings("hx", resolveEditor(&map));
-    // An empty value is not a choice of editor.
     try map.put("VISUAL", "");
     try testing.expectEqualStrings("nano", resolveEditor(&map));
 }

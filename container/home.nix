@@ -18,9 +18,8 @@
   programs.direnv = {
     enable = true;
     nix-direnv.enable = true;
-    # direnv runs untrusted project code, but the VM — not this whitelist — is the
-    # security boundary, so there's no point locking it down. Projects are bind-mounted
-    # at the VM's own path, which differs per host user (/home vs /var/home on FCOS).
+    # The VM, not this whitelist, is the security boundary. Both prefixes because the
+    # VM's home path differs per host (/home vs /var/home on FCOS).
     config.whitelist.prefix = [ "/home" "/var/home" ];
     stdlib = ''
       declare -A direnv_layout_dirs
@@ -33,19 +32,9 @@
     '';
   };
 
-  # The whole container-side addition for issue tracking, and deliberately no more:
-  #   tmux  holds the agent session so a dropped ssh connection cannot kill it
-  #   curl  the status line reaches the host's endpoint through the reverse tunnel
-  #   jq    the seeded hooks parse their stdin payload with it
-  #
-  # tmux lives here rather than on the VM because the connection that breaks is host→VM,
-  # so the multiplexer has to be on the far side of it — and the VM is immutable Fedora
-  # CoreOS, where layering a package is far more awkward than one line of Nix.
-  #
-  # Nothing is mounted for issues at all: the agent reaches the store over the tunnel.
-  #
-  # No flake.lock is committed for this image and CI re-locks weekly, so everything added
-  # here drifts. Keep the seeded scripts dependent on these three and a POSIX shell only.
+  # tmux is here rather than on the VM because the connection that breaks is host→VM, so
+  # the multiplexer has to be on the far side of it. The seeded scripts may depend on
+  # tmux, curl, jq and a POSIX shell only: this image re-locks weekly and the rest drifts.
   home.packages = with pkgs; [
     claude-code
     cursor-cli

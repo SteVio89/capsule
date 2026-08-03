@@ -1,17 +1,4 @@
 //! The CLI/TUI ↔ daemon wire format: one JSON object per line, request and response.
-//!
-//! No framing beyond the newline, no streaming, no subscriptions. The board polls on a
-//! timer, so nothing here needs to push. Deliberately not an RPC library — the whole
-//! contract is small enough to read in one screen, and that is worth more than codegen.
-//!
-//! ```
-//! {"id":1,"method":"issue.list","params":{"project":"/real/path","state":"open"}}
-//! {"id":1,"ok":true,"result":{...}}
-//! {"id":1,"ok":false,"error":{"code":"no_project","message":"…","hint":"capsule project add"}}
-//! ```
-//!
-//! Method names mirror the CLI's nouns and verbs one-for-one, so a bash command is a
-//! one-line marshal and the mapping is never in doubt.
 
 const std = @import("std");
 
@@ -84,8 +71,6 @@ pub fn parseRequest(arena: std.mem.Allocator, line: []const u8) ParseResult {
     };
     if (method.len == 0) return .{ .err = .missing_method };
 
-    // A missing id is legal and means zero — a caller that does not correlate replies
-    // should not have to invent one.
     const id: u64 = switch (object.get("id") orelse std.json.Value{ .integer = 0 }) {
         .integer => |i| if (i < 0) return .{ .err = .bad_json } else @intCast(i),
         else => return .{ .err = .bad_json },
@@ -117,8 +102,6 @@ pub fn writeErr(w: *std.Io.Writer, id: u64, code: Code, message: []const u8) !vo
     }
     try w.writeAll("}}\n");
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -212,6 +195,5 @@ test "writeErr escapes a message that would otherwise break the line" {
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeErr(&w, 1, .internal, "broke \"here\"\nand here");
-    // One line out, whatever went in — the newline is the framing.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
 }

@@ -1,12 +1,4 @@
 //! Event replay: `(state, event) -> outcome`, and nothing else.
-//!
-//! `events` is the source of truth and is append-only; `issues.state` is a cache of what
-//! replaying them produces. That is what preserves the trust posture — an agent can claim
-//! completion but cannot erase the record or rewrite an issue to match what it built.
-//!
-//! Which is why this is a plain function over plain values rather than a SQL expression.
-//! Buried in a query it could not be enumerated, and a direct `UPDATE issues SET state`
-//! anywhere else would erode the property silently.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -50,14 +42,10 @@ pub fn apply(current: ?State, event: Event) Outcome {
     switch (event.kind) {
         .created, .filed_by_agent => return .{ .illegal = .already_exists },
 
-        // A record of what was said or written never changes state, and stays legal even
-        // once an issue is done — that is where the post-merge note lands.
         .commented => return .unchanged,
         else => {},
     }
 
-    // `done` is terminal, and saying so once is more use to a reader than reporting each
-    // event as separately unreachable. Comments are exempt above: they change nothing.
     if (state == .done) return .{ .illegal = .terminal };
 
     switch (event.kind) {
@@ -71,16 +59,12 @@ pub fn apply(current: ?State, event: Event) Outcome {
                 .in_progress, .blocked, .ready_for_review => {},
                 else => return .{ .illegal = .agent_may_not },
             };
-            // A proposed issue is not dispatched and an archived one is not live, so
-            // neither has a working state to report from.
             switch (state) {
                 .proposed, .archived => return .{ .illegal = .unreachable_from },
                 else => {},
             }
             switch (to) {
                 .open, .in_progress, .blocked, .ready_for_review => return .{ .moved = to },
-                // Merge and archive are their own events; routing them through
-                // state_changed would let the agent reach them.
                 .done, .archived, .proposed => return .{ .illegal = .unreachable_from },
             }
         },
@@ -102,8 +86,6 @@ pub fn apply(current: ?State, event: Event) Outcome {
 
         .merged => return switch (state) {
             .open, .in_progress, .blocked, .ready_for_review => .{ .moved = .done },
-            // Merging something never triaged, or something explicitly set aside, would
-            // make `done` mean two different things.
             .proposed, .archived, .done => .{ .illegal = .unreachable_from },
         },
     }
@@ -122,8 +104,6 @@ pub fn fold(events: []const Event) ?State {
     }
     return state;
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 

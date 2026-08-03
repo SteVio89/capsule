@@ -1,11 +1,4 @@
 //! Raw mode, the alternate screen, and painting a `Screen` to a terminal.
-//!
-//! Hand-rolled ANSI rather than a library. The surface needed is small — alt screen, hide
-//! cursor, absolute positioning, sixteen colours, one input poll — and taking a
-//! dependency would mean a `build.zig.zon` entry, which forces the Nix build through a
-//! fixed-output derivation with a hash to maintain. Zig 0.16 also moved `std.fs`,
-//! `std.net`, `std.process` and the whole Reader/Writer story at once, so every Zig TUI
-//! library is mid-port; adopting one means inheriting its schedule.
 
 const std = @import("std");
 const posix = std.posix;
@@ -16,8 +9,6 @@ const Screen = screen_mod.Screen;
 pub const Size = struct { w: usize, h: usize };
 
 /// The one terminal a signal or panic handler can restore. Set while raw mode is active.
-/// A handler has no way to receive a *Term, so this is global by necessity, and the
-/// board only ever runs one terminal.
 var emergency: ?*Term = null;
 
 /// Restores the terminal from a context that cannot carry state: the panic handler and
@@ -29,8 +20,6 @@ pub fn emergencyRestore() void {
 
 fn onFatalSignal(sig: posix.SIG) callconv(.c) void {
     emergencyRestore();
-    // Re-deliver with the default action so the exit status still says "killed by
-    // signal" — swallowing the signal here would turn kill into a no-op.
     posix.sigaction(sig, &.{
         .handler = .{ .handler = posix.SIG.DFL },
         .mask = posix.sigemptyset(),
@@ -72,8 +61,6 @@ pub const Term = struct {
         t.active = true;
         emergency = t;
 
-        // ISIG is off, so ctrl-c arrives as a key — but SIGTERM and SIGHUP still arrive
-        // from outside, and dying to one of those must not strand the terminal.
         for ([_]posix.SIG{ .TERM, .HUP }) |sig| {
             posix.sigaction(sig, &.{
                 .handler = .{ .handler = onFatalSignal },
@@ -125,7 +112,6 @@ pub const Term = struct {
 
         var buf: [1]u8 = undefined;
         const n = posix.read(t.tty, &buf) catch return .closed;
-        // POLLIN or POLLHUP with zero bytes both mean the stream is over.
         if (n == 0) return .closed;
         return .{ .key = buf[0] };
     }
@@ -140,7 +126,6 @@ pub fn paint(fd: posix.fd_t, current: Screen, previous: ?Screen, out: *std.Array
         if (previous) |prev| {
             if (y < prev.h and current.rowsEqual(prev, y)) continue;
         }
-        // 1-based, and clear to end of line so a shortened row does not leave debris.
         try out.print(gpa, "\x1b[{d};1H\x1b[K", .{y + 1});
 
         var style: screen_mod.Style = .{};
@@ -162,12 +147,8 @@ pub fn paint(fd: posix.fd_t, current: Screen, previous: ?Screen, out: *std.Array
 /// `posix.write` moved into the Io layer in 0.16, and threading an `Io` through here
 /// would only be so that a terminal escape sequence could be written to a tty. libc's
 /// write is the same syscall with none of that.
-///
-/// Errors are dropped on purpose: this is called from `leaveRaw`, which itself runs from
-/// a defer, a signal handler, and a panic handler. There is nothing useful to do with a
-/// failure to restore a terminal that is already going away.
 fn writeAll(fd: posix.fd_t, bytes: []const u8) void {
-    if (fd < 0) return; // tests paint into a buffer and never reach a terminal
+    if (fd < 0) return;
     var written: usize = 0;
     while (written < bytes.len) {
         const n = std.c.write(fd, bytes.ptr + written, bytes.len - written);
@@ -175,8 +156,6 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) void {
         written += @intCast(n);
     }
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -188,7 +167,6 @@ test "painting the first frame emits every row" {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    // fd -1 so nothing reaches a terminal; the buffer is what is under test.
     try paint(-1, s, null, &out, testing.allocator);
 
     try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1;1H") != null);

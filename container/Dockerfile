@@ -1,6 +1,6 @@
 # Build context is the repo root: podman build -f container/Dockerfile -t capsule-dev .
-# Fully qualified: podman on Fedora CoreOS enforces short-name resolution and cannot
-# prompt over a non-interactive ssh session.
+# Fully qualified because podman on Fedora CoreOS cannot prompt for short-name
+# resolution over a non-interactive ssh session.
 FROM docker.io/nixos/nix:latest
 
 RUN printf 'experimental-features = nix-command flakes\n' >> /etc/nix/nix.conf

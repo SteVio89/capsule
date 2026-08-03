@@ -1,14 +1,8 @@
 #!/usr/bin/env sh
 # capsule status line — a template. Edit it; capsule will not overwrite your version.
 #
-# The format is a preference, not policy. capsule's job is to make the data trivially
-# available, not to dictate how it looks.
-#
-# `GET /status` rather than MCP: MCP is JSON-RPC with an initialisation handshake, which
-# is far too much machinery to run on every status-line render. Same server, same token,
-# read-only.
-#
-# Depends only on POSIX sh, curl and jq.
+# `GET /status` rather than MCP: the JSON-RPC handshake is too much machinery to run on
+# every render. Depends only on POSIX sh, curl and jq.
 
 status=$(curl -s --max-time 1 \
   -H "authorization: Bearer ${CAPSULE_RUN_TOKEN:-}" \

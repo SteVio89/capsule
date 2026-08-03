@@ -14,28 +14,35 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+
+          # The build.zig.zon dependency tree. The sandbox has no network, so the build
+          # runs with `--system` against this; bump the hash when a dependency changes.
+          zigDeps = pkgs.stdenvNoCC.mkDerivation {
+            name = "capsuled-zig-deps";
+            src = ./.;
+            dontConfigure = true;
+            dontInstall = true;
+            buildPhase = ''
+              export HOME=$TMPDIR ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
+              ${pkgs.lib.getExe pkgs.zig_0_16} build --fetch=all
+              mv zig-pkg $out
+            '';
+            outputHashMode = "recursive";
+            outputHashAlgo = "sha256";
+            outputHash = "sha256-OxmNJSwrnzWUF6DcbjUcTSYcmrc5GAVP3PH4+gcdQEc=";
+          };
         in
         {
           default = self.packages.${system}.capsule;
 
-          # The daemon, the MCP endpoint and the TUI, in one binary. Host-only: the
-          # container reaches it over the tunnel and never runs it, so it is deliberately
-          # absent from the image's build context (bin container share, below).
-          #
-          # Pinned to zig_0_16 rather than `zig`, which is an alias that will roll to 0.17
-          # the week it lands. The opposite of the image's weekly re-lock, on purpose.
           capsuled = pkgs.stdenv.mkDerivation {
             pname = "capsuled";
             version = "0.1.0";
             src = ./.;
 
-            # zig's setup hook supplies configure/build/check/install phases. doCheck is
-            # what actually runs zigCheckPhase (`zig build test`) inside the sandbox —
-            # mkDerivation defaults it off, and without it the "works in the devshell,
-            # breaks in the derivation" class goes uncaught despite the CI comment
-            # promising otherwise.
-            nativeBuildInputs = [ pkgs.zig_0_16 pkgs.pkg-config ];
-            buildInputs = [ pkgs.sqlite ];
+            nativeBuildInputs = [ pkgs.zig_0_16 ];
+            zigBuildFlags = [ "--system" "${zigDeps}" ];
+            zigCheckFlags = [ "--system" "${zigDeps}" ];
             doCheck = true;
 
             meta = {
@@ -54,8 +61,8 @@
 
             installPhase = ''
               runHook preInstall
-              # `capsule image` sends this tree to the VM as the podman build context,
-              # so it has to keep the repo layout: bin/ container/ share/.
+              # `capsule image` ships this tree to the VM as the podman build context,
+              # so the repo layout has to survive packaging.
               mkdir -p $out/libexec/capsule
               cp -r bin container share $out/libexec/capsule/
               install -Dm755 bin/capsule $out/bin/capsule
@@ -65,10 +72,7 @@
                 --prefix PATH : ${
                   pkgs.lib.makeBinPath (
                     with pkgs;
-                    # fzf is a hard dependency: every command that takes an id also accepts
-                    # none and opens a picker instead.
-                    # tuicr is what `run review` opens; without it the command falls
-                    # back to `git log -p`.
+                    # fzf and tuicr are hard dependencies: the id pickers and `run review`.
                     [ git curl jq fzf tuicr coreutils gnused gawk gnutar gzip findutils ]
                     ++ [ self.packages.${system}.capsuled ]
                     ++ lib.optionals stdenv.isDarwin [ qemu butane xz ]
@@ -95,12 +99,8 @@
         {
           home.packages = [ self.packages.${system}.capsule capsuled ];
 
-          # A long-lived user service, not something a command starts on demand. The
-          # daemon has to be up before the VM exists and has to survive `vm destroy`, and
-          # it holds the ssh master and the reverse tunnel for the VM's whole lifetime.
-          #
-          # `capsule daemon start` drives whichever of these is installed, and falls back
-          # to a plain background process when neither is — so `nix run` still works.
+          # A long-lived user service: the daemon outlives `vm destroy` and holds the ssh
+          # master and reverse tunnel. `capsule daemon start` drives whichever is present.
           systemd.user.services.capsuled = lib.mkIf pkgs.stdenv.isLinux {
             Unit.Description = "capsule host daemon";
             Service = {
@@ -131,9 +131,8 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               shellcheck butane qemu jq fzf tuicr
-              zig_0_16 zls pkg-config
+              zig_0_16 zls
             ];
-            buildInputs = [ pkgs.sqlite ];
           };
         }
       );

@@ -1,12 +1,4 @@
 //! What the dashboard shows, as a pure function of the world model.
-//!
-//! `render` takes data and dimensions and returns a grid. No terminal, no clock, no
-//! socket — which is what makes the layout golden-testable, and it is the only part of
-//! the TUI worth testing.
-//!
-//! Read-only, and staying that way in v1. Every mutation goes through the CLI: a keystroke
-//! cannot be piped, scripted, or written down in an issue thread, and a TUI that owns the
-//! actions would regrow a worse CLI inside itself within six months.
 
 const std = @import("std");
 const screen = @import("screen.zig");
@@ -48,14 +40,10 @@ pub fn render(
 
     var y: usize = 0;
     s.write(0, y, "capsule", .{ .bold = true });
-    // Age, not the absolute time. "how stale is this" is the only question a reader of a
-    // polled dashboard actually has.
     var age_buf: [32]u8 = undefined;
     const age = if (snapshot.observed_at_ms == 0)
         "never polled"
     else
-        // Saturating: observed_at_ms crosses a parse of daemon output, and a hostile or
-        // corrupt value must render as garbage, never trap on overflow.
         std.fmt.bufPrint(&age_buf, "{d}s ago", .{
             @max(0, @divTrunc(now_ms -| snapshot.observed_at_ms, 1000)),
         }) catch "?";
@@ -84,8 +72,6 @@ fn renderVm(s: *Screen, snapshot: world.Snapshot, start: usize) usize {
     y += 1;
 
     if (!snapshot.reachable) {
-        // Never numbers from a previous poll. A dashboard showing stale figures as
-        // current is worse than one showing nothing, because it looks right.
         s.writeKeyValue(2, y, "state", "unreachable", .{ .fg = .red });
         return y + 1;
     }
@@ -106,7 +92,6 @@ fn renderVm(s: *Screen, snapshot: world.Snapshot, start: usize) usize {
         const text = std.fmt.bufPrint(&buf, "{d} GB of {d} GB ({d}%)", .{
             used / (1 << 30), total / (1 << 30), pct,
         }) catch "?";
-        // Nudge, not alarm: a full VM disk is the failure people hit and never see coming.
         const style: Style = if (pct >= 90) .{ .fg = .red } else if (pct >= 75) .{ .fg = .yellow } else .{};
         s.writeKeyValue(2, y, "disk", text, style);
         y += 1;
@@ -115,10 +100,6 @@ fn renderVm(s: *Screen, snapshot: world.Snapshot, start: usize) usize {
 }
 
 /// Issues by state, and the triage count with the command that clears it.
-///
-/// Triage itself never appears here as an action. It is an editor invocation, which is
-/// exactly what the read-only split exists to keep out of the dashboard — so the board
-/// names the command and stops.
 fn renderIssues(s: *Screen, p: Project, start: usize) usize {
     var y = start;
     s.write(0, y, "issues", .{ .bold = true });
@@ -131,10 +112,9 @@ fn renderIssues(s: *Screen, p: Project, start: usize) usize {
         if (y >= s.h) return y;
         var buf: [16]u8 = undefined;
         const count = std.fmt.bufPrint(&buf, "{d}", .{p.issues[i]}) catch "?";
-        // `ready` is the agent's claim and the thing a human is meant to act on next.
         const style: Style = switch (i) {
-            3 => .{ .fg = .red }, // blocked
-            4 => .{ .fg = .green }, // ready_for_review
+            3 => .{ .fg = .red },
+            4 => .{ .fg = .green },
             else => .{},
         };
         s.writeKeyValue(2, y, label, count, style);
@@ -161,15 +141,12 @@ fn renderMemory(s: *Screen, p: Project, start: usize) usize {
 
     var buf: [64]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{d}/{d} active", .{ p.memory_active, p.memory_cap }) catch "?";
-    // At the cap, adding requires deactivating one in the same pass — worth seeing coming.
     const style: Style = if (p.memory_active >= p.memory_cap) .{ .fg = .yellow } else .{};
     s.writeKeyValue(2, y, "active", text, style);
     y += 1;
 
     if (p.memory_tokens > 0 and y < s.h) {
         var tb: [64]u8 = undefined;
-        // Approximate, and labelled so: there is no tokeniser here and a soft warning does
-        // not justify one.
         const tokens = std.fmt.bufPrint(&tb, "~{d} (approx)", .{p.memory_tokens}) catch "?";
         s.writeKeyValue(2, y, "tokens", tokens, if (p.memory_over_budget) .{ .fg = .yellow } else .{});
         y += 1;
@@ -227,12 +204,6 @@ fn renderBranches(s: *Screen, snapshot: world.Snapshot, project: ?Project, start
         y += 1;
     }
 
-    // "ready_for_review" and "this branch has commits" are independent signals: one is
-    // the agent's claim, the other is derived from git. Where they disagree, work is
-    // either unreported or unstarted — and that is precisely what would otherwise be
-    // invisible, so it gets said out loud. Compared against this project's branches
-    // only: the list above spans the whole VM, and another project's waiting commits
-    // say nothing about this project's claims.
     if (project) |p| {
         const ready = p.issues[@intFromEnum(model.Issue.State.ready_for_review)];
         if (y < s.h and ready > project_shown) {
@@ -249,8 +220,6 @@ fn renderBranches(s: *Screen, snapshot: world.Snapshot, project: ?Project, start
     }
     return y;
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -280,8 +249,6 @@ test "an unreachable VM says so and shows no figures" {
     try expectRowContains(s, 0, "capsule");
     try expectRowContains(s, 0, "never polled");
     try testing.expect((try findRow(s, "unreachable")) != null);
-    // The absence is the point: no uptime, no disk, nothing that could be mistaken for
-    // a current reading.
     try testing.expect((try findRow(s, "uptime")) == null);
     try testing.expect((try findRow(s, "disk")) == null);
 }
@@ -307,7 +274,6 @@ test "a healthy VM shows uptime, disk, containers and branches" {
     try testing.expect((try findRow(s, "20 GB of 80 GB (25%)")) != null);
     try testing.expect((try findRow(s, "capsule-018f2a1c")) != null);
 
-    // A branch with commits is what "waiting" means; one without is not shown at all.
     try testing.expect((try findRow(s, "capsule/018f2a1c")) != null);
     try testing.expect((try findRow(s, "capsule/018f2a3d")) == null);
     try testing.expect((try findRow(s, "3 commits")) != null);
@@ -382,9 +348,7 @@ test "issues by state, with triage named as a command and never as an action" {
 
     try testing.expect((try findRow(s, "proposed")) != null);
     try testing.expect((try findRow(s, "ready")) != null);
-    // The count and the command, so the buffer is discoverable without the board owning it.
     try testing.expect((try findRow(s, "2 awaiting triage — capsule issue triage")) != null);
-    // Archived is zero here and simply absent, rather than a row of noise.
     try testing.expect((try findRow(s, "archived")) == null);
 }
 
@@ -411,9 +375,7 @@ test "the token estimate is labelled approximate" {
 }
 
 test "a claim with no commits is called out, and so is the reverse" {
-    // These are independent signals — one is the agent's word, one is git — and work the
-    // agent never reported would otherwise be invisible.
-    const claimed = Project{ .issues = .{ 0, 0, 0, 0, 2, 0, 0 } }; // 2 ready
+    const claimed = Project{ .issues = .{ 0, 0, 0, 0, 2, 0, 0 } };
     var a = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, claimed, 1, 100, 40);
     defer a.deinit(testing.allocator);
     try testing.expect((try findRow(a, "2 claimed ready with no commits waiting")) != null);
@@ -433,8 +395,6 @@ test "a claim with no commits is called out, and so is the reverse" {
 }
 
 test "another project's waiting branches do not contradict this project's claims" {
-    // The branch list spans the whole VM; the claim cross-check must not. Two commits
-    // waiting on an unrelated replica say nothing about this project's silence.
     const snapshot = world.Snapshot{
         .reachable = true,
         .observed_at_ms = 1,
@@ -448,7 +408,6 @@ test "another project's waiting branches do not contradict this project's claims
     defer s.deinit(testing.allocator);
     try testing.expect((try findRow(s, "never reported")) == null);
     try testing.expect((try findRow(s, "claimed ready")) == null);
-    // The foreign branches are still listed — the VM panel is VM-wide.
     try testing.expect((try findRow(s, "capsule/a")) != null);
 }
 

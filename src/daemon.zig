@@ -1,9 +1,4 @@
 //! The host daemon: the only process that opens the store.
-//!
-//! The CLI and the board never touch SQLite. That is not fastidiousness about WAL —
-//! sqlite would tolerate several writers. It is that this process holds an in-memory
-//! world model, and a CLI writing behind its back would leave the dashboard showing
-//! wrong data with no way to tell.
 
 const std = @import("std");
 const net = std.Io.net;
@@ -55,8 +50,7 @@ pub const Daemon = struct {
     /// Read by three threads (accept loop, poller, HTTP) and written by daemon.stop —
     /// atomic so no thread ever reasons from a torn or stale read.
     quit: std.atomic.Value(bool) = .init(false),
-    /// False when the loopback endpoint could not be bound. Reported by daemon.status:
-    /// a daemon whose agents cannot reach it must not present as healthy.
+    /// False when the loopback endpoint could not be bound.
     http_up: std.atomic.Value(bool) = .init(false),
 
     /// Opens the store and prepares an idle daemon. Nothing is bound or spawned yet —
@@ -76,8 +70,6 @@ pub const Daemon = struct {
     /// Tears down what `init` (and a run of `serve`) built: kills the tunnel if one is
     /// up, closes the store, and frees the snapshot arena.
     pub fn deinit(d: *Daemon) void {
-        // kill blocks until the child is gone and reaps it; a wait after it would assert
-        // on the already-cleared pid.
         if (d.tunnel) |*child| child.kill(d.io);
         d.store.close();
         d.snapshot_arena.deinit();
@@ -97,8 +89,6 @@ pub const Daemon = struct {
             );
 
             d.mutex.lockUncancelable(d.io);
-            // The old arena goes only once the new snapshot is installed, so the strings
-            // a reader is holding stay valid for as long as the lock says they do.
             d.snapshot_arena.deinit();
             d.snapshot_arena = fresh;
             d.snapshot = snapshot;
@@ -107,8 +97,6 @@ pub const Daemon = struct {
             d.reconcileTunnel(snapshot.reachable);
             d.reconcileRuns(snapshot);
 
-            // Seconds between ticks, deliberately. These facts change on a human
-            // timescale and each tick is a VM round trip.
             Io.sleep(
                 d.io,
                 .{ .nanoseconds = @intCast(d.poll_interval_s * std.time.ns_per_s) },
@@ -118,21 +106,10 @@ pub const Daemon = struct {
     }
 
     /// Brings the tunnel up when the VM appears and tears it down when the VM goes away.
-    ///
-    /// Re-established on availability rather than assumed at boot: the daemon starts
-    /// before the VM exists, and `capsule vm destroy` is a normal thing to do under it.
-    ///
-    /// A held handle is not a live tunnel: ssh exits on its own when the forward is
-    /// already bound or the connection drops, and a daemon that only asked "do I hold a
-    /// handle" would keep a dead tunnel's seat warm for the VM's whole lifetime. So every
-    /// tick reaps an exited child first, which is also what keeps it from lingering as a
-    /// zombie.
     fn reconcileTunnel(d: *Daemon, reachable: bool) void {
         if (d.tunnel) |child| {
             if (child.id) |pid| {
                 var status: c_int = undefined;
-                // waitpid reaps it; kill/wait on the Child afterwards would address a
-                // recycled pid, so the handle is simply dropped.
                 if (std.c.waitpid(pid, &status, std.c.W.NOHANG) == pid) d.tunnel = null;
             } else d.tunnel = null;
         }
@@ -153,14 +130,6 @@ pub const Daemon = struct {
     }
 
     /// Marks any run whose container has gone as `abandoned` and revokes its token.
-    ///
-    /// Both this and the CLI's own end-of-run call are required. The poll alone would
-    /// leave phantom runs live until it next fired; the CLI alone never runs when the
-    /// terminal is the thing that died.
-    ///
-    /// Skipped entirely when the VM is unreachable — an unreachable VM says nothing about
-    /// whether a container is running, and treating it as "no containers" would abandon
-    /// every live run the moment the network hiccuped.
     fn reconcileRuns(d: *Daemon, snapshot: world_mod.Snapshot) void {
         if (!snapshot.reachable) return;
 
@@ -210,14 +179,7 @@ pub const Daemon = struct {
 
     /// Binds and serves until `quit`. Cleans the socket up on the way out so the next
     /// start does not have to reason about a leftover it wrote itself.
-    ///
-    /// The helper threads are *joined* on the way out, before the caller's `deinit` can
-    /// close the store and arenas they read — detaching them here was a use-after-free
-    /// on every ordinary `daemon stop`.
     pub fn serve(d: *Daemon) !void {
-        // Two daemons racing through "is that socket stale?" at once would both conclude
-        // yes and both bind — the flock makes probe-and-claim one atomic step. Held for
-        // the daemon's lifetime and released by the close below on the way out.
         const lock_fd = try acquireStartLock(d.gpa, d.socket_path);
         defer _ = std.c.close(lock_fd);
 
@@ -228,9 +190,6 @@ pub const Daemon = struct {
         defer server.deinit(d.io);
         defer Io.Dir.cwd().deleteFile(d.io, d.socket_path) catch {};
 
-        // The world model and the HTTP endpoint each get a thread. Both outlive any one
-        // request, and neither may block the accept loop. A spawn failure is loud but not
-        // fatal: a daemon without a poller still serves the store.
         const poller = std.Thread.spawn(.{}, poll, .{d}) catch |err| blk: {
             std.log.warn("world-model poller did not start: {t}", .{err});
             break :blk null;
@@ -241,16 +200,10 @@ pub const Daemon = struct {
             break :blk null;
         };
         defer if (server_thread) |t| t.join();
-        // These run before the joins above (defers unwind LIFO). The quit store covers
-        // the error paths out of this function, where no request ever set it — without
-        // that, the joins would wait on threads that have no reason to stop. The nudge
-        // wakes the HTTP thread's blocking accept so it can notice.
         defer d.nudgeHttp();
         defer d.quit.store(true, .release);
 
         while (!d.quit.load(.acquire)) {
-            // A client that gives up mid-handshake is routine, not a reason to stop
-            // serving; anything else is the daemon's own problem and should surface.
             const stream = server.accept(d.io) catch |err| switch (err) {
                 error.ConnectionAborted, error.WouldBlock => continue,
                 else => return err,
@@ -279,7 +232,6 @@ pub const Daemon = struct {
         const w = &writer.interface;
 
         while (true) {
-            // The newline is the entire framing, and this is the one call that knows it.
             const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
                 error.StreamTooLong => {
                     try protocol.writeErr(w, 0, .too_large, "request line too long");
@@ -289,14 +241,9 @@ pub const Daemon = struct {
                 else => return,
             } orelse return;
 
-            // An arena per request: every reply is built and flushed before it is
-            // dropped, so nothing here needs to think about lifetimes.
             var arena = std.heap.ArenaAllocator.init(d.gpa);
             defer arena.deinit();
 
-            // Built in full before any byte hits the socket: dispatch holds the global
-            // mutex, and a slow reader must stall only its own connection, not the lock
-            // every other caller and the poller are waiting on.
             var out: std.ArrayList(u8) = .empty;
             var buffered = std.Io.Writer.Allocating.fromArrayList(arena.allocator(), &out);
 
@@ -320,10 +267,6 @@ pub const Daemon = struct {
     }
 
     /// `capsule project` — register, list, retire, and set the profile.
-    ///
-    /// Registration is explicit and is the barrier. Nothing here writes into the
-    /// repository: a project is a row in the host's store and nothing else, which is what
-    /// keeps capsule out of the user's tree entirely.
     fn dispatchProject(
         d: *Daemon,
         arena: std.mem.Allocator,
@@ -359,7 +302,6 @@ pub const Daemon = struct {
             return w.writeAll("]}\n");
         }
 
-        // Everything below identifies a project by where it is on disk.
         const canonical = d.canonicalPath(arena, params) catch
             return protocol.writeErr(w, request.id, .bad_params, "not a git repository");
 
@@ -449,10 +391,6 @@ pub const Daemon = struct {
     }
 
     /// `capsule issue` — the human side of the tracker.
-    ///
-    /// Note what is missing: nothing here lets a caller set `done` or `archived` other
-    /// than through their own events, and there is no path for an agent at all. Agents
-    /// reach the store through MCP, where the token says which issue they are on.
     fn dispatchIssue(
         d: *Daemon,
         arena: std.mem.Allocator,
@@ -501,8 +439,6 @@ pub const Daemon = struct {
             return w.writeAll("]}\n");
         }
 
-        // Everything the dashboard needs about a project in one call. The board polls on a
-        // timer, and a call per state would multiply that by seven for no benefit.
         if (std.mem.eql(u8, verb, "summary")) {
             const all = try d.store.listIssues(arena, project_id, null);
             var counts = [_]usize{0} ** std.meta.fields(model_mod.Issue.State).len;
@@ -514,8 +450,6 @@ pub const Daemon = struct {
             const proposals = try d.store.listMemories(arena, project_id, .proposed);
 
             try w.print("{{\"id\":{d},\"ok\":true,\"result\":{{\"replica\":", .{request.id});
-            // The replica name is what joins this project to the world model's branch
-            // rows — without it the board cannot say which branches are *this* project's.
             try std.json.Stringify.encodeJsonString(
                 try project_mod.replicaName(arena, canonical),
                 .{},
@@ -544,8 +478,6 @@ pub const Daemon = struct {
             return d.dispatchTriage(arena, w, request, project_id, verb);
         }
 
-        // Everything below names an issue, and names it the way git names a commit: as
-        // many leading characters as are unambiguous.
         const prefix = stringParam(params, "id") orelse
             return protocol.writeErr(w, request.id, .bad_params, "no issue id given");
         const rows = try d.store.listIssues(arena, project_id, null);
@@ -572,8 +504,6 @@ pub const Daemon = struct {
             if (title == null and body == null) {
                 return protocol.writeErr(w, request.id, .bad_params, "nothing to change");
             }
-            // The caller read this when it opened the editor. If it has moved since, some
-            // other terminal wrote in the meantime and this edit would silently undo it.
             const expected = if (stringParam(params, "last_event_id")) |hex|
                 ids.parseHex(hex) catch null
             else
@@ -598,9 +528,6 @@ pub const Daemon = struct {
             return d.writeIssue(w, request.id, fresh);
         }
 
-        // The only route to `done`. There is no manual close and no agent-set `done`:
-        // the agent's claim is `ready_for_review`, and merging its branch is the decision.
-        // Keeping the claim and the decision as different states is the whole point.
         if (std.mem.eql(u8, verb, "merge")) {
             _ = d.store.appendEvent(
                 ids.generateNow(d.io),
@@ -622,9 +549,6 @@ pub const Daemon = struct {
             return d.writeIssue(w, request.id, fresh);
         }
 
-        // Archive is the "not merging this" path, and it always carries a reason. It is
-        // reversible on purpose: `issue reopen` puts it back to `open` and work resumes
-        // on the branch it already has, which is why gc must never sweep an archived one.
         if (std.mem.eql(u8, verb, "archive") or std.mem.eql(u8, verb, "reopen")) {
             const archiving = std.mem.eql(u8, verb, "archive");
             const reason = stringParam(params, "reason") orelse "";
@@ -699,10 +623,6 @@ pub const Daemon = struct {
     }
 
     /// `capsule run` — the lifecycle of a container session.
-    ///
-    /// `run.start` is where the token is minted. It is bound to (project, issue, run) and
-    /// is the reason the MCP tools need no arguments: the caller's identity *is* the
-    /// answer to "which issue am I on".
     fn dispatchRun(
         d: *Daemon,
         arena: std.mem.Allocator,
@@ -744,8 +664,6 @@ pub const Daemon = struct {
         }
 
         if (std.mem.eql(u8, verb, "start")) {
-            // One run per project at a time: the replica keeps a single working tree, so
-            // a second container would be checking out over the first one's work.
             if (try d.store.activeRunForProject(arena, project_id)) |live| {
                 const row = try d.store.getIssue(arena, live.issue_id);
                 try w.print(
@@ -799,9 +717,6 @@ pub const Daemon = struct {
 
             const profile = (try d.store.projectProfile(arena, project_id)) orelse "default";
 
-            // The only time the token is ever emitted. It is written to a mode-0600 file
-            // on the VM and passed to podman with --env-file, never with -e: an -e would
-            // put it in the VM's process table and in shell history.
             try w.print(
                 "{{\"id\":{d},\"ok\":true,\"result\":{{\"run\":\"{s}\",\"issue\":\"{s}\"," ++
                     "\"token\":\"{s}\",\"container\":\"{s}\",\"profile\":",
@@ -825,8 +740,6 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, verb, "end")) {
             const live = (try d.store.activeRunForProject(arena, project_id)) orelse
                 return protocol.writeErr(w, request.id, .refused, "no run is live on this project");
-            // `ended` means the user quit. The poll marks `abandoned` for anything that
-            // simply vanished, and the two must stay distinguishable.
             try d.store.finishRun(live.run_id, .ended, now);
             return protocol.writeOk(w, request.id, "{\"ended\":true}");
         }
@@ -835,16 +748,6 @@ pub const Daemon = struct {
     }
 
     /// `POST /mcp` — the agent's only route into the store.
-    ///
-    /// The token identifies the run, and the run identifies the project and the issue. So
-    /// none of the tools take a project or an issue argument: the agent cannot address the
-    /// wrong issue, cannot spoof another, and cannot touch a run it does not own. The
-    /// dispatch mapping is enforced here rather than being advisory.
-    ///
-    /// This is a hole drilled from the container back to the host, and it is acceptable
-    /// only because it is narrow. If a "read this file" or "run this command" tool ever
-    /// looks convenient here, it is not: that turns this into a remote shell into the host
-    /// and undoes the whole tool. Build a separate mechanism with its own consent instead.
     fn serveMcp(
         d: *Daemon,
         arena: std.mem.Allocator,
@@ -859,8 +762,6 @@ pub const Daemon = struct {
             return http.writeResponse(w, 200, "application/json", bw.written());
         };
 
-        // The handshake happens before any tool call, so it must not require a token —
-        // and it reveals nothing.
         if (std.mem.eql(u8, request.method, "initialize")) {
             var buf: std.ArrayList(u8) = .empty;
             var bw = std.Io.Writer.Allocating.fromArrayList(arena, &buf);
@@ -868,7 +769,6 @@ pub const Daemon = struct {
             return http.writeResponse(w, 200, "application/json", bw.written());
         }
 
-        // A notification takes no reply at all; answering one is a protocol violation.
         if (mcp.isNotification(request)) {
             return http.writeResponse(w, 202, "text/plain", "");
         }
@@ -956,9 +856,6 @@ pub const Daemon = struct {
             const issue = (try d.store.getIssue(arena, binding.issue_id)) orelse
                 return mcp.writeToolResult(w, request_id, "this issue no longer exists", true);
 
-            // Memories ride in this response rather than behind a tool the agent might
-            // never call: get_issue is the one call it reliably makes, and the hard cap is
-            // what makes sending the whole active set viable.
             const memories = try d.store.listMemories(arena, binding.project_id, .active);
 
             var text: std.ArrayList(u8) = .empty;
@@ -983,9 +880,6 @@ pub const Daemon = struct {
                 return mcp.writeToolResult(w, request_id, "not a state I know", true);
 
             const comment = stringParam(args, "comment") orelse "";
-            // Enforced here, not just asked for in the description: the event log is the
-            // only continuity between runs, and a bare state change tells the next person
-            // nothing about where this one got to.
             if ((to == .blocked or to == .ready_for_review) and
                 std.mem.trim(u8, comment, " \t\r\n").len == 0)
             {
@@ -1046,16 +940,10 @@ pub const Daemon = struct {
                 return mcp.writeToolResult(w, request_id, "a follow-up needs a title", true);
             const body = stringParam(args, "body") orelse "";
 
-            // Look for near-duplicates *before* filing, and report them in the response.
-            // Agents file duplicates at a high rate, and this is the only moment the
-            // information is worth anything.
             const existing = try d.store.listIssues(arena, binding.project_id, null);
             var similar: std.ArrayList(store_mod.Store.IssueRow) = .empty;
             for (existing) |row| {
                 switch (row.state) {
-                    // Closed states carry no duplication risk. `proposed` is excluded for
-                    // a different reason: those are agent filings a human has not triaged,
-                    // and the model documents them as never shown to an agent.
                     .done, .archived, .proposed => continue,
                     else => {},
                 }
@@ -1154,8 +1042,6 @@ pub const Daemon = struct {
             );
             for (proposed) |row| {
                 try tw.writer.print("## keep {s}  {s}\n", .{ ids.short(row.id), row.title });
-                // Indented, never raw: the body is agent-authored, and its ordinary
-                // markdown must not read as capsule headings or comments.
                 if (row.body.len > 0) try buffer_mod.renderBody(&tw.writer, row.body);
                 try tw.writer.writeAll("\n");
             }
@@ -1171,8 +1057,6 @@ pub const Daemon = struct {
             const text = stringParam(params, "buffer") orelse
                 return protocol.writeErr(w, request.id, .bad_params, "no buffer");
 
-            // Captured now, so an issue the agent files while the buffer is open is left
-            // alone rather than being swept into a decision nobody made about it.
             const proposed = try d.store.listIssues(arena, project_id, .proposed);
             var expected = try arena.alloc([]const u8, proposed.len);
             for (proposed, 0..) |row, i| expected[i] = try arena.dupe(u8, &ids.short(row.id));
@@ -1189,9 +1073,6 @@ pub const Daemon = struct {
                 ),
             };
 
-            // One transaction around the whole plan: the buffer promised "applied
-            // together", and a mid-loop store error must leave the set untouched, not
-            // half-triaged with no way to tell which half.
             try d.store.begin();
             errdefer d.store.rollback();
 
@@ -1200,8 +1081,6 @@ pub const Daemon = struct {
             for (entries) |entry| {
                 const row = findByShort(proposed, entry.id) orelse continue;
                 if (std.mem.eql(u8, entry.verb, "accept")) {
-                    // Title and body as edited: triage is where a vague agent filing gets
-                    // turned into something workable.
                     try d.store.editIssue(ids.generateNow(d.io), row.id, entry.title, entry.body, null, .human, now);
                     _ = try d.store.appendEvent(
                         ids.generateNow(d.io),
@@ -1213,9 +1092,6 @@ pub const Daemon = struct {
                     );
                     accepted += 1;
                 } else if (std.mem.eql(u8, entry.verb, "reject")) {
-                    // Rejection is archive with a reason, not a separate state, and the
-                    // reason is whatever was left in the buffer. Nothing is deleted: what
-                    // the agent noticed is worth keeping even when the answer is no.
                     _ = try d.store.appendEvent(
                         ids.generateNow(d.io),
                         row.id,
@@ -1310,16 +1186,6 @@ pub const Daemon = struct {
 
         const now = Io.Timestamp.now(d.io, .real).toMilliseconds();
 
-        // Which memories a merge has just made suspect.
-        //
-        // The caller supplies the deleted/renamed paths, because only it knows the merge
-        // range — `git diff --name-status --diff-filter=DR <merge-base>..<merged>`. That
-        // is the one moment the information exists, and it makes staleness a fact about
-        // the code rather than a clock.
-        //
-        // Deleted or renamed only, never modified: "changed substantially" is a judgement
-        // that produces noisy flags nobody trusts, and a flag nobody trusts is worse than
-        // no flag at all.
         if (std.mem.eql(u8, verb, "stale")) {
             var gone: std.ArrayList([]const u8) = .empty;
             if (params.get("paths")) |value| switch (value) {
@@ -1366,8 +1232,6 @@ pub const Daemon = struct {
             const body = stringParam(params, "body") orelse
                 return protocol.writeErr(w, request.id, .bad_params, "a memory needs a body");
 
-            // A human-authored memory is subject to the same cap. Nothing about writing it
-            // by hand makes it more deserving of a slot.
             const active_now: usize = @intCast(try d.store.countActiveMemories(project_id));
             switch (memory_mod.applyCap(active_now, &.{.{ .id = "new", .verb = .activate }})) {
                 .refused => return protocol.writeErr(
@@ -1414,8 +1278,6 @@ pub const Daemon = struct {
                 try tw.writer.writeAll("\n");
             }
             if (active.len > 0) {
-                // Listed below the proposals so duplicates are visible and a slot can be
-                // freed in the same pass — which is the only way to accept at the cap.
                 try tw.writer.writeAll("<!-- existing active memories below — deactivate to make room -->\n\n");
                 for (active) |row| {
                     try tw.writer.print("## keep {s}\n", .{ids.short(row.id)});
@@ -1458,9 +1320,6 @@ pub const Daemon = struct {
                 ),
             };
 
-            // Each verb is checked against the memory's *current* state before it counts
-            // toward anything. Without this, 'deactivate' on a proposal reads as freeing
-            // a slot that was never occupied, and the cap quietly stops being a cap.
             var decisions: std.ArrayList(memory_mod.Decision) = .empty;
             for (entries) |entry| {
                 const v = memory_mod.Verb.parse(entry.verb) orelse continue;
@@ -1487,7 +1346,6 @@ pub const Daemon = struct {
                 try decisions.append(arena, .{ .id = entry.id, .verb = v });
             }
 
-            // Checked before anything is written, so a refusal leaves the set untouched.
             const active_now: usize = @intCast(try d.store.countActiveMemories(project_id));
             switch (memory_mod.applyCap(active_now, decisions.items)) {
                 .refused => |r| return protocol.writeErr(
@@ -1504,8 +1362,6 @@ pub const Daemon = struct {
                 .applied => {},
             }
 
-            // One transaction for the whole plan, like triage: a review either lands in
-            // full or not at all.
             try d.store.begin();
             errdefer d.store.rollback();
 
@@ -1514,9 +1370,6 @@ pub const Daemon = struct {
                 const v = memory_mod.Verb.parse(entry.verb) orelse continue;
                 const row = findMemoryByShort(all, entry.id) orelse continue;
 
-                // The buffer says its text "all applies together", and that includes the
-                // text: a reviewer who tightened the wording or fixed the anchors gets
-                // those edits kept, on every verb including keep.
                 const edited = try splitAnchors(arena, entry.body);
                 if (!std.mem.eql(u8, edited.body, row.body) or
                     !std.mem.eql(u8, edited.anchors, std.mem.trim(u8, row.anchors, "\n")))
@@ -1548,10 +1401,6 @@ pub const Daemon = struct {
     }
 
     /// Which replica branches `vm gc` may delete.
-    ///
-    /// Swept by issue state, never by asking git. Squash-merge means a branch's commits
-    /// are not ancestors of the main branch, so `git branch -d` refuses and every
-    /// git-based "is it merged" check answers no.
     fn dispatchGc(
         d: *Daemon,
         arena: std.mem.Allocator,
@@ -1568,8 +1417,6 @@ pub const Daemon = struct {
         const project_id = (try d.store.findProject(canonical)) orelse
             return protocol.writeErr(w, request.id, .no_project, canonical);
 
-        // `done` only. An archived issue keeps its branch, because `issue reopen` resumes
-        // work on it — deleting those would silently destroy reopenable work.
         const done = try d.store.listIssues(arena, project_id, .done);
         try w.print("{{\"id\":{d},\"ok\":true,\"result\":[", .{request.id});
         for (done, 0..) |row, i| {
@@ -1582,9 +1429,6 @@ pub const Daemon = struct {
     fn serveHttpRequest(d: *Daemon, stream: net.Stream) !void {
         setSocketTimeouts(stream, 30);
 
-        // Three separate buffers on purpose. `reader_buf` belongs to the Reader and it
-        // may move bytes around inside it at will; `head_buf` is ours to accumulate into
-        // across reads. Sharing one array between the two silently loses the request.
         var reader_buf: [4096]u8 = undefined;
         var head_buf: [http.max_head]u8 = undefined;
         var write_buf: [8192]u8 = undefined;
@@ -1593,15 +1437,9 @@ pub const Daemon = struct {
         const w = &writer.interface;
         defer w.flush() catch {};
 
-        // Line at a time until the blank one, which is exactly HTTP's own framing.
-        //
-        // Not `readSliceShort`: despite the name it loops until the buffer is *full*,
-        // returning short only at end of stream. Handed a head-sized buffer it blocks
-        // waiting for bytes a small request will never send, and the connection hangs.
         var used: usize = 0;
         while (true) {
             const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
-                // A single header longer than the read buffer, or no newline at all.
                 error.StreamTooLong => return http.writeResponse(w, 413, "text/plain", "header too long\n"),
                 else => return,
             };
@@ -1625,8 +1463,6 @@ pub const Daemon = struct {
             defer arena.deinit();
             const gpa = arena.allocator();
 
-            // Whatever arrived with the head, plus however much more content-length says
-            // is still coming.
             var body: std.ArrayList(u8) = .empty;
             try body.appendSlice(gpa, head_buf[head.body_start..used]);
             while (body.items.len < head.content_length) {
@@ -1639,9 +1475,6 @@ pub const Daemon = struct {
             return d.serveMcp(gpa, w, head, body.items);
         }
 
-        // `GET /status` exists because a shell script cannot practically speak MCP: that
-        // is JSON-RPC with an initialisation handshake, which is far too much machinery to
-        // run on every status-line render. Same server, same token, read-only.
         if (head.method == .get and std.mem.eql(u8, head.target, "/status")) {
             var arena = std.heap.ArenaAllocator.init(d.gpa);
             defer arena.deinit();
@@ -1665,7 +1498,6 @@ pub const Daemon = struct {
         const active = d.store.activeRuns(arena) catch
             return http.writeResponse(w, 500, "text/plain", "store unavailable\n");
 
-        // The store's rows carry the hash as bytes; token.resolve wants it typed.
         var bindings = try arena.alloc(token_mod.Binding(ids.Id), active.len);
         var n: usize = 0;
         for (active) |run| {
@@ -1754,8 +1586,6 @@ pub const Daemon = struct {
         }
 
         if (std.mem.eql(u8, request.method, "world.get")) {
-            // Written straight to the socket rather than built into a string: the caller
-            // is going to print it, and there is nothing to inspect on the way past.
             try w.print("{{\"id\":{d},\"ok\":true,\"result\":", .{request.id});
             try d.writeSnapshot(arena, w);
             return w.writeAll("}\n");
@@ -1771,18 +1601,9 @@ pub const Daemon = struct {
 };
 
 /// The loopback HTTP endpoint the container reaches through the reverse tunnel.
-///
-/// Bound to 127.0.0.1 and nothing else. The tunnel forwards the VM's loopback here, and
-/// the container sees that loopback via `--network=host` — so the endpoint is reachable
-/// from the agent without ever being bound on a network interface.
-///
-/// `GET /ping` is the whole surface for now, and exists to prove the tunnel end to end
-/// before any MCP machinery is written on top of it.
 fn serveHttp(d: *Daemon) void {
     const addr: net.IpAddress = .{ .ip4 = .loopback(d.ssh_config.mcp_port) };
     var server = addr.listen(d.io, .{ .reuse_address = true }) catch |err| {
-        // Loud and recorded: without this endpoint every agent in the container is cut
-        // off, and a daemon that hid that would present as healthy while being useless.
         std.log.warn("cannot bind 127.0.0.1:{d}: {t} — the MCP endpoint is down", .{
             d.ssh_config.mcp_port, err,
         });
@@ -1801,8 +1622,6 @@ fn serveHttp(d: *Daemon) void {
 }
 
 /// Takes the exclusive start lock at `<socket>.lock`, or fails with `AlreadyRunning`.
-/// Returns the held fd; the lock lives exactly as long as it stays open. The lockfile
-/// itself is never deleted — unlinking a lockfile reopens the race it exists to close.
 fn acquireStartLock(gpa: std.mem.Allocator, socket_path: []const u8) !std.posix.fd_t {
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{socket_path});
     defer gpa.free(lock_path);
@@ -1813,7 +1632,6 @@ fn acquireStartLock(gpa: std.mem.Allocator, socket_path: []const u8) !std.posix.
         0o600,
     );
     errdefer _ = std.c.close(fd);
-    // libc's flock: the syscall is not surfaced through std.posix in 0.16.
     if (std.c.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB) != 0) return error.AlreadyRunning;
     return fd;
 }
@@ -1821,21 +1639,12 @@ fn acquireStartLock(gpa: std.mem.Allocator, socket_path: []const u8) !std.posix.
 /// A socket file left by a daemon that died is indistinguishable from one a live daemon
 /// is listening on — until you try to talk to it. Ask first: if something answers, this
 /// is a second daemon and it must not start. If nothing does, the file is debris.
-///
-/// Unlinking a socket that *is* in use would be the worse mistake of the two: the running
-/// daemon would keep serving a path nothing can reach any more.
-///
-/// Note on the connect below: a stale socket answers ECONNREFUSED, which Zig 0.16 does not
-/// map into `ConnectError` and so reports as `error.Unexpected` — with a stack trace to
-/// stderr in Debug builds. That is this function's ordinary success path, not a fault.
 fn clearStaleSocket(io: Io, path: []const u8) !void {
     const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return,
     };
 
-    // Anything that is not a socket cannot be a live daemon, so skip the probe entirely
-    // rather than asking the kernel to connect to a regular file.
     if (stat.kind != .unix_domain_socket) {
         Io.Dir.cwd().deleteFile(io, path) catch {};
         return;
@@ -1850,8 +1659,6 @@ fn clearStaleSocket(io: Io, path: []const u8) !void {
         Io.Dir.cwd().deleteFile(io, path) catch {};
     }
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -1876,7 +1683,7 @@ fn looksSimilar(a: []const u8, b: []const u8) bool {
     var shared: usize = 0;
     var words = std.mem.tokenizeAny(u8, a, " \t\n-_/.,:;()[]");
     while (words.next()) |word| {
-        if (word.len < 4) continue; // "the", "and", "fix" carry no signal
+        if (word.len < 4) continue;
         if (std.ascii.indexOfIgnoreCase(b, word) != null) shared += 1;
         if (shared >= 2) return true;
     }

@@ -1,22 +1,11 @@
 //! UUIDv7 identifiers and git-style unique-prefix resolution.
-//!
-//! v7 because the first 48 bits are a millisecond timestamp: rows land in creation order
-//! without a sort key, and index locality is good.
-//!
-//! Rendered as 32 lowercase hex characters with no dashes. These IDs are never handed to
-//! anything outside capsule, and the canonical dashed form would only complicate prefix
-//! matching for no reader's benefit.
 
 const std = @import("std");
 
 pub const Id = [16]u8;
 
-/// How much of an ID the dashboard and `issue list` show.
-///
-/// Taken from the **end** of the hex, not the start. A UUIDv7 begins with a 48-bit
-/// millisecond timestamp, so the first eight hex characters are the top 32 bits of it —
-/// which only change every 65 seconds. Every issue filed in the same minute would share a
-/// "short id", which is not an id at all. The last eight characters are pure entropy.
+/// How much of an ID the dashboard and `issue list` show, taken from the **end**: a
+/// UUIDv7 opens with a timestamp, so the leading characters barely differ between issues.
 pub const short_len = 8;
 
 pub const hex_len = 32;
@@ -86,10 +75,6 @@ fn nibble(c: u8) ParseError!u8 {
 }
 
 /// Git's short-SHA behaviour: a prefix resolves when exactly one ID starts with it.
-///
-/// `ambiguous` carries no candidate list on purpose — collecting one would need an
-/// allocator and make this impure. A caller that wants to print the candidates re-scans
-/// with `hasPrefix`, which costs nothing at this scale and happens only on the error path.
 pub const Resolution = union(enum) {
     resolved: usize,
     ambiguous,
@@ -102,9 +87,6 @@ pub const Resolution = union(enum) {
 
 /// Accepts what a person would actually type: a leading piece of the **short id** (what
 /// `issue list` prints), or a leading piece of the full hex (what the API returns).
-///
-/// Both are supported because both are visible. Matching only the full hex would reject
-/// the id shown on screen; matching only the short id would reject the one in a script.
 pub fn resolvePrefix(prefix: []const u8, ids: []const Id) Resolution {
     if (prefix.len == 0 or prefix.len > hex_len) return .malformed;
     for (prefix) |c| _ = nibble(c) catch return .malformed;
@@ -128,14 +110,11 @@ pub fn matches(id: Id, prefix: []const u8) bool {
 }
 
 /// True when `prefix` leads the full 32-character hex form only (not the short id).
-/// Case-insensitive; an over-long prefix is simply false.
 pub fn hasPrefix(id: Id, prefix: []const u8) bool {
     const hex = toHex(id);
     if (prefix.len > hex.len) return false;
     return std.ascii.eqlIgnoreCase(hex[0..prefix.len], prefix);
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -212,9 +191,6 @@ test "short is the display prefix" {
 }
 
 test "short ids come from the entropy, not the clock" {
-    // The bug this guards against: UUIDv7 starts with a 48-bit millisecond timestamp, so
-    // the first eight hex characters only change every 65 seconds. Every issue filed in
-    // the same minute would have shared a "short id".
     var entropy_a = [_]u8{0} ** 16;
     var entropy_b = [_]u8{0} ** 16;
     entropy_a[15] = 0xaa;
@@ -222,7 +198,7 @@ test "short ids come from the entropy, not the clock" {
 
     const ms: i64 = 1_785_000_000_000;
     const a = generate(ms, entropy_a);
-    const b = generate(ms, entropy_b); // same millisecond
+    const b = generate(ms, entropy_b);
 
     try testing.expect(!std.mem.eql(u8, &short(a), &short(b)));
 }
@@ -232,14 +208,10 @@ test "a short id resolves, and so does a leading piece of the full hex" {
         fixed("018f2a1c00000000000000000000aaaa"),
         fixed("018f2a1c00000000000000000000bbbb"),
     };
-    // Same timestamp prefix on both — resolving on that would be ambiguous, which is
-    // exactly what used to happen for every issue.
     try testing.expectEqual(Resolution.ambiguous, resolvePrefix("018f2a1c", &ids));
 
-    // The short id distinguishes them.
     try testing.expectEqual(Resolution{ .resolved = 0 }, resolvePrefix("0000aaaa", &ids));
     try testing.expectEqual(Resolution{ .resolved = 1 }, resolvePrefix("0000bbbb", &ids));
-    // And so does a longer piece of the full hex.
     try testing.expectEqual(
         Resolution{ .resolved = 0 },
         resolvePrefix("018f2a1c00000000000000000000aaaa", &ids),

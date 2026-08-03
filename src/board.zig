@@ -1,12 +1,4 @@
 //! The dashboard's run loop: poll the daemon, render, paint, read a key, repeat.
-//!
-//! Read-only. It observes and navigates and takes no actions — every mutation goes
-//! through the CLI. Actions may be added later, one at a time, each delegating to the
-//! command that already exists; never as a parallel implementation.
-//!
-//! Note what this does *not* do: shell out to `capsule vm status` on a timer. Each of
-//! those is a fresh ssh handshake, and five of them per refresh would be slow and flaky.
-//! The daemon already holds the answers.
 
 const std = @import("std");
 const Io = std.Io;
@@ -35,12 +27,8 @@ pub fn run(
     /// no realpath.
     project_params: []const u8,
 ) !void {
-    // Fail before touching the terminal. Entering raw mode and then discovering there is
-    // nothing to show would leave the user staring at an empty alternate screen.
     _ = client.call(arena, io, socket_path, "ping", "{}") catch return error.DaemonNotRunning;
 
-    // Piping the dashboard somewhere is a reasonable thing to try and a nonsensical thing
-    // to do, so say which it is rather than reporting a termios errno.
     var t = term.Term.init() catch return error.NotATerminal;
     try t.enterRaw();
     defer t.leaveRaw();
@@ -52,16 +40,12 @@ pub fn run(
     defer if (previous) |*p| p.deinit(gpa);
 
     while (true) {
-        // Fresh arena per frame: the snapshot's strings are parsed out of the response
-        // and live exactly as long as the frame that drew them.
         var frame = std.heap.ArenaAllocator.init(gpa);
         defer frame.deinit();
 
         const snapshot = fetch(frame.allocator(), io, socket_path) catch world.Snapshot{};
 
         const size = t.size();
-        // Null when the board was opened outside a registered project, or when the
-        // summary call fails — the VM panel is still worth showing on its own.
         const project = if (project_params.len > 0)
             fetchProject(frame.allocator(), io, socket_path, project_params) catch null
         else
@@ -81,18 +65,15 @@ pub fn run(
         if (previous) |*p| p.deinit(gpa);
         previous = current;
 
-        // Each poll waits up to 100ms, so ten of them is roughly the refresh interval
-        // and a keypress is still noticed immediately.
         var waited: usize = 0;
         while (waited < refresh_ms / 100) : (waited += 1) {
             switch (t.readKey()) {
                 .key => |key| switch (key) {
-                    'q', 3 => return, // 3 is ctrl-c, which raw mode stops delivering as a signal
+                    'q', 3 => return,
                     'r' => break,
                     else => {},
                 },
                 .timeout => {},
-                // A vanished terminal has nobody watching; exiting is the only sane move.
                 .closed => return,
             }
         }
@@ -183,8 +164,6 @@ fn stringOf(value: ?std.json.Value) ?[]const u8 {
         else => null,
     };
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 

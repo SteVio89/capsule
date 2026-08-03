@@ -1,10 +1,4 @@
 //! capsuled: one binary, three roles — daemon, MCP endpoint, dashboard client.
-//!
-//! Bash calls this for anything structured. The call direction is one-way: bash calls
-//! Zig, Zig never calls back into bash.
-//!
-//! Argument marshalling only. Everything with logic in it lives in the core module, where
-//! it can be tested without a socket, a database, or a terminal.
 
 const std = @import("std");
 const capsuled = @import("capsuled");
@@ -34,9 +28,7 @@ const usage =
     \\
 ;
 
-/// Dispatches on argv[1] and returns the process exit code, which bash branches on:
-/// 0 success, 1 error or aborted editor, 2 usage, 3 editor saved with no changes.
-/// The codes are a contract — changing one silently breaks the bash side.
+/// Dispatches on argv[1] and returns the process exit code, which bash branches on.
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
 
@@ -49,7 +41,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer err.interface.flush() catch {};
 
     var args = init.minimal.args.iterate();
-    _ = args.next(); // argv[0]
+    _ = args.next();
     const command = args.next() orelse {
         try out.interface.writeAll(usage);
         return 2;
@@ -71,8 +63,6 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     if (std.mem.eql(u8, command, "daemon")) {
-        // The data directory is capsuled's to create: it starts before the VM exists and
-        // must not need anything laid out for it first.
         std.Io.Dir.cwd().createDirPath(init.io, paths.data_dir) catch {};
 
         const ctl_dir = init.environ_map.get("CAPSULE_CTL_DIR") orelse
@@ -89,8 +79,6 @@ pub fn main(init: std.process.Init) !u8 {
                 .mcp_port = parsePort(init.environ_map.get("CAPSULE_MCP_PORT"), 8765),
                 .image = init.environ_map.get("CAPSULE_IMAGE") orelse "",
             },
-            // Clamped away from zero: an interval of 0 would turn the poll loop into
-            // back-to-back ssh probes of the VM.
             .poll_interval_s = @max(1, parsePort(init.environ_map.get("CAPSULE_POLL_INTERVAL"), 3)),
         }) catch |e| {
             try err.interface.print("capsuled: cannot open {s}: {t}\n", .{ paths.db, e });
@@ -114,11 +102,6 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    // `capsuled edit <seed> [header]` — the editor round trip, in the *client*. The daemon
-    // is a background service with no terminal, so it could not spawn an editor even in
-    // principle. Prints the new text on stdout. Exit codes: 0 changed, 3 saved-unchanged,
-    // 1 aborted or discarded — unchanged is its own code because some call sites (the
-    // merge message) treat accepting the seed as success, and bash cannot tell otherwise.
     if (std.mem.eql(u8, command, "edit")) {
         const seed = args.next() orelse "";
         const header = args.next() orelse "";
@@ -127,8 +110,6 @@ pub fn main(init: std.process.Init) !u8 {
         else
             seed;
 
-        // An explicit TMPDIR wins; otherwise prefer XDG_RUNTIME_DIR, which the OS keeps
-        // per-user and mode 0700 — issue bodies briefly live in this file.
         const tmp = init.environ_map.get("TMPDIR") orelse
             init.environ_map.get("XDG_RUNTIME_DIR") orelse "/tmp";
         const result = capsuled.editor.editText(arena, init.io, init.environ_map, seeded, tmp) catch |e| {
@@ -145,9 +126,6 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    // `capsuled seed <dir> <issue-short> <title> <project-dir> [port]` — materialise a
-    // run's agent-state tree. bash then ships it to the VM; keeping the templating here
-    // means bash never has to build JSON.
     if (std.mem.eql(u8, command, "seed")) {
         const dir = args.next() orelse {
             try err.interface.writeAll("usage: capsuled seed <dir> <issue> <title> <project-dir> [port]\n");
@@ -164,7 +142,6 @@ pub fn main(init: std.process.Init) !u8 {
             .{init.environ_map.get("XDG_CONFIG_HOME") orelse
                 try std.fmt.allocPrint(arena, "{s}/.config", .{init.environ_map.get("HOME") orelse "/root"})},
         );
-        // A missing template is the normal case, not an error: policy alone is enough.
         const template = std.Io.Dir.cwd().readFileAlloc(init.io, template_path, arena, .limited(1 << 20)) catch "";
 
         capsuled.seed.writeTree(arena, init.io, dir, template, .{
@@ -179,9 +156,6 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    // `capsuled container-cmd <name> <project-dir> <state-dir> <env-file> <profile> [issue]`
-    // — one shell-quoted line, ready to hand to ssh. Built here so the quoting is a
-    // tested function rather than two shells' worth of escaping rules in bash.
     if (std.mem.eql(u8, command, "container-cmd") or std.mem.eql(u8, command, "attach-cmd")) {
         const is_attach = std.mem.eql(u8, command, "attach-cmd");
         const name = args.next() orelse return 2;
@@ -206,9 +180,6 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "board")) {
-        // bash passes the project params, because resolving them needs `pwd -P` and
-        // 0.16's stdlib has no realpath. Empty means "outside a repository", and the
-        // board shows the VM panel alone.
         const project_params = args.next() orelse "";
         capsuled.board.run(arena, init.gpa, init.io, paths.socket, project_params) catch |e| switch (e) {
             error.DaemonNotRunning => {
@@ -230,8 +201,6 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    // Everything else is a client call. The method name is passed straight through, so a
-    // new daemon method needs no change here.
     const params = args.next() orelse "{}";
     const response = capsuled.client.call(arena, init.io, paths.socket, command, params) catch |e| switch (e) {
         error.DaemonNotRunning => {

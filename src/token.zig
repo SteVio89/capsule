@@ -1,14 +1,5 @@
 //! The per-run token: minted at `run start`, injected into the container, revoked when
 //! the run ends.
-//!
-//! This is not primarily a security mechanism. Its real job is that **the daemon knows
-//! which issue the caller is working on without the agent having to say so**. The MCP
-//! tools therefore take no project or issue arguments — fewer parameters, less context,
-//! and nothing for the agent to get wrong. The dispatch mapping is enforced at the API
-//! boundary rather than being advisory.
-//!
-//! Only a hash is ever stored. The token itself lives in the container's environment for
-//! the duration of the run and nowhere else.
 
 const std = @import("std");
 
@@ -61,13 +52,6 @@ pub fn Resolution(comptime Id: type) type {
 }
 
 /// Pure: a header value and the set of live runs in, a binding out.
-///
-/// Compared with `timingSafeEql` — the cost is nothing and the alternative is a
-/// byte-at-a-time comparison whose timing leaks the prefix.
-///
-/// Revocation is not modelled here: an ended run is simply absent from `active`, which
-/// means "revoked" and "never existed" are the same answer. That is deliberate — the
-/// difference is not something a caller should be able to probe for.
 pub fn resolve(
     comptime Id: type,
     header: ?[]const u8,
@@ -75,7 +59,6 @@ pub fn resolve(
 ) Resolution(Id) {
     const presented = header orelse return .absent;
     if (presented.len == 0) return .absent;
-    // A token is fixed-length; anything else cannot match and is not worth hashing.
     if (presented.len != encoded_len) return .unknown;
 
     const digest = hash(presented);
@@ -84,8 +67,6 @@ pub fn resolve(
     }
     return .unknown;
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 const TestId = [16]u8;
@@ -119,8 +100,6 @@ test "a token resolves to exactly its own run" {
 }
 
 test "no header is absent, not unknown" {
-    // Different answers on purpose: a caller that forgot the header gets a different
-    // message from one presenting something we do not recognise.
     try testing.expectEqual(
         Resolution(TestId).absent,
         resolve(TestId, null, &.{}),
@@ -141,7 +120,6 @@ test "an unrecognised token is refused" {
 
 test "a token from an ended run no longer resolves" {
     const gone = "a" ** encoded_len;
-    // The run is simply not in the active set any more. Revoking is removing.
     try testing.expectEqual(Resolution(TestId).unknown, resolve(TestId, gone, &.{}));
 }
 
@@ -166,8 +144,6 @@ test "hashing is stable and distinguishes tokens" {
 }
 
 test "an encoded token is url-safe and has no padding" {
-    // It travels in an env var, a JSON string, and an HTTP header; anything needing
-    // escaping in one of those would eventually be mangled by the other.
     const encoded = "A" ** encoded_len;
     for (encoded) |c| switch (c) {
         'A'...'Z', 'a'...'z', '0'...'9', '-', '_' => {},

@@ -1,14 +1,9 @@
 //! capsuled's core: everything the daemon, the client, and the board share.
-//!
-//! The rule that keeps this testable is that the interesting logic lives in pure
-//! functions here — event replay, buffer parsing, prefix resolution, the socket envelope —
-//! and the IO lives in thin wrappers around them.
 
 pub const id = @import("id.zig");
 pub const model = @import("model.zig");
 pub const replay = @import("replay.zig");
 pub const protocol = @import("protocol.zig");
-pub const sqlite = @import("sqlite.zig");
 pub const store = @import("store.zig");
 pub const paths = @import("paths.zig");
 pub const project = @import("project.zig");
@@ -33,8 +28,6 @@ pub const tui = struct {
 
 test {
     @import("std").testing.refAllDecls(@This());
-    // refAllDecls references `tui` as a type without analysing what is inside it, so the
-    // nested modules' tests would never be compiled in. Name them directly.
     _ = @import("tui/screen.zig");
     _ = @import("tui/board.zig");
     _ = @import("tui/term.zig");

@@ -1,17 +1,4 @@
 //! Materialises the run's agent-state directory.
-//!
-//! The token and the endpoint let the agent *ask* about its issue. Nothing so far makes
-//! it do so — and agents forgetting the tracker exists is the failure this whole design
-//! is built to prevent. So the MCP config, the policy settings and an opening instruction
-//! are written for it.
-//!
-//! **Agent state is per run**, copied from the profile's at start and discarded at end.
-//! A shared `~/.claude` would be worse than untidy: several projects share a profile, so
-//! a run token written there is visible to — and overwritten by — the next run in that
-//! profile, and an agent silently authenticated as someone else's run is the worst
-//! failure this design can produce.
-//!
-//! No file in the user's project is touched. That is hard constraint 1.
 
 const std = @import("std");
 const Io = std.Io;
@@ -30,10 +17,6 @@ pub const Run = struct {
 /// The MCP server entry, written to `.claude.json` in the run's agent-state directory —
 /// user scope, not a `.mcp.json` at the project root, which would put capsule's own
 /// configuration inside the user's repository.
-///
-/// The token is referenced as `${CAPSULE_RUN_TOKEN}` rather than substituted. Claude Code
-/// expands environment variables in `headers`, so the file on disk carries no secret at
-/// all and the token lives only in the process environment.
 pub fn mcpConfig(arena: std.mem.Allocator, run: Run) ![]const u8 {
     return std.fmt.allocPrint(arena,
         \\{{
@@ -76,11 +59,6 @@ pub fn instructions(arena: std.mem.Allocator, run: Run) ![]const u8 {
 }
 
 /// Two layers, merged with **capsule policy winning**.
-///
-/// Not one blob the user edits in place: that would be clobbered on every release, and
-/// policy would be silently overridable in the meantime.
-///
-/// Pure, so the precedence rule is testable without a filesystem.
 pub fn mergeSettings(
     arena: std.mem.Allocator,
     user_template: []const u8,
@@ -101,12 +79,6 @@ pub fn mergeSettings(
         } else |_| {}
     }
 
-    // Then policy, overwriting whatever the template said.
-    //
-    // bypassPermissions is not a convenience setting: it is the point of the tool. A
-    // container, in a VM, on a git replica with no remotes, with every change gated
-    // behind `run review`. If permission prompts are still wanted here, the isolation is
-    // not earning its cost.
     try merged.put(arena, "permissions", .{ .object = blk: {
         var permissions: std.json.ObjectMap = .empty;
         try permissions.put(arena, "defaultMode", .{ .string = "bypassPermissions" });
@@ -120,9 +92,6 @@ pub fn mergeSettings(
         break :blk line;
     } });
 
-    // Hooks are merged, not replaced: the template's own hooks keep running, and the
-    // policy hooks are appended per event so they cannot be configured away. Claude Code
-    // runs every matching entry, so append is the union.
     try merged.put(arena, "hooks", .{ .object = try mergeHooks(arena, merged.get("hooks")) });
 
     return std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = merged }, .{ .whitespace = .indent_2 });
@@ -158,8 +127,6 @@ fn mergeHooks(arena: std.mem.Allocator, user_hooks: ?std.json.Value) !std.json.O
 fn hookConfig(arena: std.mem.Allocator) !std.json.ObjectMap {
     var hooks: std.json.ObjectMap = .empty;
 
-    // MultiEdit is in the matcher deliberately. Omitting it is how the host version let
-    // every multi-edit through without a word.
     try hooks.put(arena, "PostToolUse", try matcherArray(
         arena,
         "Write|Edit|MultiEdit",
@@ -174,7 +141,6 @@ fn matcherArray(arena: std.mem.Allocator, matcher: []const u8, command: []const 
     try hook.put(arena, "type", .{ .string = "command" });
     try hook.put(arena, "command", .{ .string = command });
 
-    // std.json.Array is a *managed* list — it carries its allocator, unlike ObjectMap.
     var inner = std.json.Array.init(arena);
     try inner.append(.{ .object = hook });
 
@@ -218,12 +184,6 @@ fn writeFile(
 ) !void {
     const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name });
     var file = try Io.Dir.cwd().createFile(io, path, .{
-        // A hook that is written but not executable is a hook that silently never runs,
-        // which is the same failure mode as a matcher that matches nothing.
-        //
-        // The enum is open (`_`), so the mode goes in numerically. 0o777 rather than
-        // 0o755 because POSIX file creation is masked by umask, exactly as `default_file`
-        // is 0o666 rather than 0o644.
         .permissions = if (executable) @enumFromInt(0o777) else .default_file,
     });
     defer file.close(io);
@@ -232,8 +192,6 @@ fn writeFile(
     try w.interface.writeAll(contents);
     try w.interface.flush();
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -253,13 +211,9 @@ test "the mcp config names the http transport and carries no secret" {
     defer a.deinit();
     const config = try mcpConfig(a.allocator(), example);
 
-    // "http", not "streamable-http" or "sse": an entry with a url and no type is read as
-    // a stdio server and skipped.
     try testing.expect(std.mem.indexOf(u8, config, "\"type\": \"http\"") != null);
     try testing.expect(std.mem.indexOf(u8, config, "localhost:8765/mcp") != null);
 
-    // The token is referenced, never substituted — Claude Code expands env vars in
-    // headers, so the file itself is not a secret.
     try testing.expect(std.mem.indexOf(u8, config, "${CAPSULE_RUN_TOKEN}") != null);
 
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a.allocator(), config, .{});
@@ -274,10 +228,8 @@ test "policy wins over the user's template" {
     );
 
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a.allocator(), merged, .{});
-    // Preferences survive.
     try testing.expectEqualStrings("dark", parsed.object.get("theme").?.string);
     try testing.expectEqualStrings("opus", parsed.object.get("model").?.string);
-    // Policy overrides the template's attempt to turn bypass off.
     try testing.expectEqualStrings(
         "bypassPermissions",
         parsed.object.get("permissions").?.object.get("defaultMode").?.string,
@@ -319,14 +271,11 @@ test "the template's own hooks survive the merge, alongside policy's" {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a.allocator(), merged, .{});
     const hooks = parsed.object.get("hooks").?.object;
 
-    // The user's PostToolUse entry comes first, policy's is appended after it.
     const post = hooks.get("PostToolUse").?.array.items;
     try testing.expectEqual(@as(usize, 2), post.len);
     try testing.expectEqualStrings("Bash", post[0].object.get("matcher").?.string);
     try testing.expectEqualStrings("Write|Edit|MultiEdit", post[1].object.get("matcher").?.string);
-    // An event policy does not use passes through untouched.
     try testing.expect(hooks.get("PreToolUse") != null);
-    // Policy-only events are still there.
     try testing.expect(hooks.get("Stop") != null);
 }
 
@@ -337,19 +286,13 @@ test "the instruction names the issue and says to fetch it" {
     try testing.expect(std.mem.indexOf(u8, text, "018f2a1c") != null);
     try testing.expect(std.mem.indexOf(u8, text, "get_issue") != null);
     try testing.expect(std.mem.indexOf(u8, text, "set_state") != null);
-    // The body is fetched, not pasted: an inlined copy would go stale and would remove
-    // the agent's reason to call the tool.
     try testing.expect(std.mem.indexOf(u8, text, "may have been edited") != null);
 }
 
 test "the shipped hooks gate on CAPSULE_PROJECT_DIR, not a host path" {
-    // The host versions checked $cwd against ~/code, which never matches in a container
-    // and so failed open — the guard silently never fired.
     try testing.expect(std.mem.indexOf(u8, comment_guard, "CAPSULE_PROJECT_DIR") != null);
     try testing.expect(std.mem.indexOf(u8, quality_gate, "CAPSULE_PROJECT_DIR") != null);
 
-    // No hardcoded host path in the *logic*. Comments may name the old one — both scripts
-    // explain the bug on purpose — so only executable lines are checked.
     for ([_][]const u8{ comment_guard, quality_gate }) |script| {
         var lines = std.mem.splitScalar(u8, script, '\n');
         while (lines.next()) |line| {
@@ -369,7 +312,6 @@ test "the quality gate bounds its output and cannot trap the session" {
 }
 
 test "the shipped scripts depend only on what the image actually has" {
-    // The image re-locks nixpkgs weekly, so anything beyond these drifts away.
     for ([_][]const u8{ "python", "perl", "node", "rg ", "fd " }) |absent| {
         try testing.expect(std.mem.indexOf(u8, comment_guard, absent) == null);
         try testing.expect(std.mem.indexOf(u8, quality_gate, absent) == null);
@@ -378,7 +320,6 @@ test "the shipped scripts depend only on what the image actually has" {
 }
 
 test "the status line asks the http endpoint, not MCP" {
-    // A shell script cannot practically speak JSON-RPC with a handshake on every render.
     try testing.expect(std.mem.indexOf(u8, statusline, "/status") != null);
     try testing.expect(std.mem.indexOf(u8, statusline, "CAPSULE_RUN_TOKEN") != null);
 }

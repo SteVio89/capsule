@@ -1,11 +1,4 @@
 //! A hand-rolled HTTP/1.1 server, about as small as one can be and still be correct.
-//!
-//! This exists for the MCP endpoint and for `GET /status`, both on loopback, single-user,
-//! no TLS. `std.http` is among the churniest parts of a pre-1.0 stdlib and none of its
-//! features are wanted here, so the request line and headers are parsed by hand.
-//!
-//! `parseHead` is pure and carries the tests. The accept loop around it is thin on
-//! purpose — nothing there is worth a mock.
 
 const std = @import("std");
 
@@ -40,8 +33,6 @@ pub fn parseHead(bytes: []const u8) ParseError!Head {
     if (bytes.len > max_head) return error.TooLarge;
 
     const end = std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse {
-        // Tolerate bare LF separators: some hand-written clients and every `printf`-based
-        // test emits them, and rejecting those costs more than accepting them.
         const lf_end = std.mem.indexOf(u8, bytes, "\n\n") orelse return error.Incomplete;
         return parseLines(bytes[0..lf_end], lf_end + 2);
     };
@@ -79,22 +70,15 @@ fn parseLines(head: []const u8, body_start: usize) ParseError!Head {
         const name = line[0..colon];
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
 
-        // This server only ever frames bodies by content-length. A transfer-encoded
-        // request would be silently misread as an empty body — the classic smuggling
-        // shape — so it is refused outright.
         if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return error.Malformed;
 
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            // Two content-lengths is two different requests fighting over one framing;
-            // last-one-wins would let them disagree silently.
             if (saw_content_length) return error.Malformed;
             saw_content_length = true;
             const n = std.fmt.parseInt(usize, value, 10) catch return error.Malformed;
             if (n > max_body) return error.TooLarge;
             result.content_length = n;
         } else if (std.ascii.eqlIgnoreCase(name, "authorization")) {
-            // `Bearer <token>`, but accept a bare token too rather than silently ignoring
-            // a header that is obviously meant as one.
             result.authorization = if (std.ascii.startsWithIgnoreCase(value, "bearer "))
                 std.mem.trim(u8, value[7..], " ")
             else
@@ -111,8 +95,6 @@ pub fn writeResponse(w: *std.Io.Writer, status: u16, content_type: []const u8, b
     try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, reason(status) });
     try w.print("content-type: {s}\r\n", .{content_type});
     try w.print("content-length: {d}\r\n", .{body.len});
-    // No keep-alive: every caller here makes one request and goes away, and connection
-    // reuse would only add state to get wrong.
     try w.writeAll("connection: close\r\n\r\n");
     try w.writeAll(body);
 }
@@ -128,8 +110,6 @@ fn reason(status: u16) []const u8 {
         else => "Error",
     };
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 

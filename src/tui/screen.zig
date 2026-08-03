@@ -1,11 +1,4 @@
 //! A character grid, and the diff between two of them.
-//!
-//! Repainting the whole terminal every few seconds flickers and fights the scrollback.
-//! Diffing two grids and emitting only the rows that changed costs about sixty lines and
-//! removes the problem entirely.
-//!
-//! Row-level rather than cell-level: at a three-second cadence the extra precision buys
-//! nothing measurable, and whole-row repaints are far easier to be sure are correct.
 
 const std = @import("std");
 
@@ -64,7 +57,6 @@ pub const Screen = struct {
     }
 
     /// Row `y` as a mutable slice into the screen's own cells — a view, not a copy.
-    /// `y` must be in bounds.
     pub fn row(s: Screen, y: usize) []Cell {
         return s.cells[y * s.w ..][0..s.w];
     }
@@ -123,8 +115,6 @@ pub const Screen = struct {
     }
 };
 
-// ---------------------------------------------------------------- tests
-
 const testing = std.testing;
 
 test "text lands where it is put" {
@@ -167,7 +157,6 @@ test "rows compare equal only when they match" {
     b.write(0, 0, "x", .{});
     try testing.expect(a.rowsEqual(b, 0));
 
-    // Same characters, different colour, is still a change worth repainting.
     b.write(0, 0, "x", .{ .fg = .red });
     try testing.expect(!a.rowsEqual(b, 0));
 }

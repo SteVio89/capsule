@@ -1,7 +1,4 @@
 //! Where capsuled keeps things on the host.
-//!
-//! Resolved once, from the environment, so a test can point the whole daemon at a
-//! scratch directory without a global to reset.
 
 const std = @import("std");
 const net = std.Io.net;
@@ -53,8 +50,6 @@ pub const Env = struct {
     capsule_socket: ?[]const u8 = null,
     capsule_db: ?[]const u8 = null,
 };
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 

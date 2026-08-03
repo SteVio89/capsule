@@ -1,8 +1,4 @@
 //! The closed sets the store is built on.
-//!
-//! Every one of these is an enum rather than a free string. A free-string event kind
-//! would make replay untestable — there would be no total set of cases to cover — and
-//! replay is the seam the trust posture rests on.
 
 const std = @import("std");
 
@@ -21,8 +17,7 @@ pub const Issue = struct {
         ready_for_review,
         /// Reached only by `run merge`. There is no manual close.
         done,
-        /// The "not merging this" path. Always carries a reason, and always reversible:
-        /// `issue reopen` resumes on the branch, which is why gc must never sweep it.
+        /// The "not merging this" path. Reversible, so gc must never sweep its branch.
         archived,
 
         /// The state exactly as spelled in the database column, or null for anything

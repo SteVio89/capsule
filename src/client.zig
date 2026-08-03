@@ -1,7 +1,4 @@
 //! The other side of the socket: one request, one response, exit.
-//!
-//! Used by `bin/capsule` for anything structured, and by the board on its poll timer.
-//! Deliberately not a session — there is nothing to keep open between two lines of JSON.
 
 const std = @import("std");
 const net = std.Io.net;
@@ -76,8 +73,6 @@ pub fn parseResponse(arena: std.mem.Allocator, line: []const u8) Error!Response 
         .object => |o| o,
         else => return error.BadResponse,
     };
-    // Typed, not an anonymous literal: an anon struct would be stringified as itself
-    // rather than coerced to a Value, and the map's internals are not serializable.
     const err_value: std.json.Value = .{ .object = err };
     return .{
         .ok = false,
@@ -95,8 +90,6 @@ fn str(value: ?std.json.Value) ?[]const u8 {
         else => null,
     };
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 

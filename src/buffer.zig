@@ -1,23 +1,4 @@
 //! The `rebase -i`-style review buffer, parsed.
-//!
-//! One parser for both triage and memory review. The verb vocabulary differs, so it is a
-//! parameter — not a reason to fork this into two files that would drift apart.
-//!
-//! Two rules are load-bearing and deliberately diverge from `rebase -i`:
-//!
-//!   - **The default verb is `keep`**, so saving an unread buffer is a no-op. That matches
-//!     the editor primitive's "unchanged means nothing happened".
-//!   - **A deleted line means keep, not delete.** Accidentally removing a line must never
-//!     destroy data, which is exactly what `rebase -i` does and exactly what nobody wants
-//!     from a backlog.
-//!
-//! And parsing never half-applies: this returns a whole plan or an error. Half-applied
-//! triage has no clean recovery.
-//!
-//! Only **column 0** is structural. Bodies come from agents, and an agent's ordinary
-//! markdown ("## Steps to reproduce", an HTML comment) must neither wedge the parse nor
-//! forge a verb — so `renderBody` indents content by two spaces on the way out, and the
-//! parser strips that indent and treats indented lines as pure body on the way back.
 
 const std = @import("std");
 
@@ -71,15 +52,10 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, options: Options) !Resu
         line_no += 1;
         const line = std.mem.trimEnd(u8, raw, "\r");
 
-        // `#` is a markdown heading, not a comment, so the context lines are HTML
-        // comments and are stripped here. Column 0 only: an indented `<!--` is body
-        // text that `renderBody` escaped, and eating it would corrupt what it carries.
         if (std.mem.startsWith(u8, line, "<!--")) continue;
 
         if (!std.mem.startsWith(u8, line, "## ")) {
             if (current != null) {
-                // Undo the render indent, and only the render indent — deeper
-                // indentation belongs to the content itself.
                 const unindented = if (std.mem.startsWith(u8, line, body_indent))
                     line[body_indent.len..]
                 else
@@ -181,12 +157,8 @@ pub fn describe(arena: std.mem.Allocator, err: Error) ![]const u8 {
 }
 
 fn trimBlank(text: []const u8) []const u8 {
-    // Newlines only: the edges to drop are blank lines, and trimming spaces here would
-    // eat real indentation off a body's first or last line.
     return std.mem.trim(u8, text, "\r\n");
 }
-
-// ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
@@ -238,8 +210,6 @@ test "an unread buffer is a no-op: every verb is keep" {
 test "a deleted entry is kept, not dropped" {
     var a = testArena();
     defer a.deinit();
-    // This is the divergence from `rebase -i` that matters: removing a line by accident
-    // must never destroy anything.
     const result = try triage(a.allocator(),
         \\## accept 018f2a1c  Kept one
     , &.{ "018f2a1c", "018f2a3d" });
@@ -256,7 +226,6 @@ test "an unknown verb is refused, and nothing is applied" {
         \\## accept 018f2a1c  Fine
         \\## delete 018f2a3d  Not a verb here
     , &.{ "018f2a1c", "018f2a3d" });
-    // The whole buffer fails: the first entry is not applied on its own.
     try testing.expectEqualStrings("delete", result.malformed.unknown_verb.verb);
     try testing.expectEqual(@as(usize, 2), result.malformed.unknown_verb.line);
 }
@@ -264,7 +233,6 @@ test "an unknown verb is refused, and nothing is applied" {
 test "an id that was not in the buffer at spawn is refused" {
     var a = testArena();
     defer a.deinit();
-    // An agent filing an issue while the buffer is open must not be swept up by it.
     const result = try triage(a.allocator(),
         \\## accept 018fbeef  Filed while you were editing
     , &.{"018f2a1c"});
@@ -289,7 +257,6 @@ test "a malformed heading is refused" {
         switch (result) {
             .malformed => {},
             .ok => |entries| {
-                // "##" alone is not a heading at all, so it is body text.
                 try testing.expectEqual(@as(usize, 0), entries.len);
             },
         }
@@ -319,9 +286,6 @@ test "an agent body full of markup round-trips through render and parse" {
     var a = testArena();
     defer a.deinit();
 
-    // The hostile-but-ordinary case: markdown headings and an HTML comment, exactly what
-    // a well-meaning agent writes into a filed issue. Rendered they are indented; parsed
-    // back they are content, not structure.
     const body = "## Steps to reproduce\n<!-- not a capsule comment -->\nplain line";
     var out: std.ArrayList(u8) = .empty;
     var w = std.Io.Writer.Allocating.fromArrayList(a.allocator(), &out);
@@ -337,7 +301,6 @@ test "an agent body full of markup round-trips through render and parse" {
 test "deeper indentation than the render indent survives untouched" {
     var a = testArena();
     defer a.deinit();
-    // A code block indented four spaces renders as six and comes back as four.
     const body = "    indented code";
     var out: std.ArrayList(u8) = .empty;
     var w = std.Io.Writer.Allocating.fromArrayList(a.allocator(), &out);
@@ -350,8 +313,6 @@ test "deeper indentation than the render indent survives untouched" {
 test "the same parser takes the memory vocabulary" {
     var a = testArena();
     defer a.deinit();
-    // Parameterised, not forked: two parsers would drift, and the divergence would be in
-    // exactly the rules that protect against data loss.
     const result = try parse(a.allocator(),
         \\## activate 018f3b2c  Test suite fails under parallel execution
         \\anchors: test/run.sh
