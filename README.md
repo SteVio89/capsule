@@ -49,8 +49,9 @@ your repo ──push──▶ replica in VM ──mount──▶ podman containe
 bootstraps the replica (`receive.denyCurrentBranch=updateInstead`, so a push
 updates the checked-out tree), pushes your current `HEAD` onto the issue's
 branch and checks it out there, then starts the container mounted on the
-project. Each run is bound to one issue, and its agent state lives in a per-run
-copy of the *profile's* state, so two profiles don't share logins or history.
+project. Each run is bound to one issue, and its agent state is built from
+scratch every time — the *profile* supplies the login token and the interface
+preferences, and nothing else survives from one run to the next.
 
 Your git identity comes along for free: `capsule run start` copies your host's
 `user.name` / `user.email` to the VM (once — a VM-side identity you set by hand
@@ -293,6 +294,21 @@ any other branch leave the replica untouched. Override which branch counts as
 
 **`capsule login [profile]`** — a container with a terminal to authenticate the agent
 CLI in; the stored token is injected into that profile's future runs (host only).
+
+A profile is a directory of one-value files under
+`~/.config/capsule/profiles/<name>/`, written by `login` and safe to edit by hand:
+
+| file | default | meaning |
+|---|---|---|
+| `token` | — | the `claude setup-token` token, injected as `CLAUDE_CODE_OAUTH_TOKEN` |
+| `theme` | `dark` | the agent's colour theme |
+| `editor-mode` | `vim` | `vim` or `normal` input mode |
+
+`theme` and `editor-mode` are seeded into each run's `.claude.json` along with the
+onboarding and trust flags. A run's agent state is built from scratch every time, so
+without them the agent would meet the first-run wizard — theme picker, login method,
+"do you trust the files in this folder?" — on every single run, with nobody there to
+answer it. `login` writes both files once and never overwrites them, so an edit sticks.
 
 ## Configuration
 

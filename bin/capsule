@@ -773,22 +773,37 @@ cmd_run_reset() {
   echo "capsule: the project is still registered — 'capsule run start' rebuilds from scratch"
 }
 
+profile_dir() { # profile_dir <profile>
+  printf '%s/capsule/profiles/%s' "${XDG_CONFIG_HOME:-$HOME/.config}" "$1"
+}
+
+# One bare file per value, the shape 'capsule login' writes. The fallback is what the
+# agent would otherwise be stopped and asked for on every run.
+profile_pref() { # profile_pref <profile> <name> <default>
+  local file value=""
+  file="$(profile_dir "$1")/$2"
+  [[ -f $file ]] && value=$(<"$file")
+  printf '%s' "${value:-$3}"
+}
+
 seed_to_vm() { # seed_to_vm <run-dir> <issue-short> <title> <project-dir> <run-token> <profile>
   local run_dir="$1" issue="$2" title="$3" proj="$4" run_token="$5" profile="$6"
-  local local_seed oauth
+  local local_seed oauth theme editor_mode
   local_seed=$(mktemp -d)
   # shellcheck disable=SC2064  # expand run_dir now, not at trap time
   trap "rm -rf '$local_seed'" RETURN
 
+  theme=$(profile_pref "$profile" theme dark)
+  editor_mode=$(profile_pref "$profile" editor-mode vim)
+
   capsuled seed "$local_seed/claude" "$issue" "$title" "$proj" "$CAPSULE_MCP_PORT" \
+    "$theme" "$editor_mode" \
     || die "could not build the agent-state tree"
 
   ssh_vm "rm -rf ~/$run_dir && mkdir -p ~/$run_dir"
   tar czf - -C "$local_seed" claude | ssh_vm "tar xzf - -C ~/$run_dir"
 
-  oauth=""
-  local token_file="${XDG_CONFIG_HOME:-$HOME/.config}/capsule/profiles/$profile/token"
-  [[ -f $token_file ]] && oauth=$(<"$token_file")
+  oauth=$(profile_pref "$profile" token "")
 
   {
     [[ -n $run_token ]] && printf 'CAPSULE_RUN_TOKEN=%s\n' "$run_token"
@@ -926,15 +941,20 @@ EOF
        -v ~/$dir/claude:$CAPSULE_CONTAINER_HOME/.claude \
        $CAPSULE_IMAGE"
 
-  local token_dir="${XDG_CONFIG_HOME:-$HOME/.config}/capsule/profiles/$profile"
-  mkdir -p "$token_dir"
+  local store; store=$(profile_dir "$profile")
+  mkdir -p "$store"
+
+  # Seeded once and then left alone: editing these files is how a profile's runs get a
+  # different theme or editor mode, so a later login must not overwrite the choice.
+  [[ -f $store/theme ]] || printf 'dark\n' > "$store/theme"
+  [[ -f $store/editor-mode ]] || printf 'vim\n' > "$store/editor-mode"
 
   local token
   read -r -s -p "paste the token (input hidden), or press enter to skip: " token < /dev/tty
   echo
   [[ -n $token ]] || { echo "no token stored"; return 0; }
 
-  ( umask 077; printf '%s\n' "$token" > "$token_dir/token" )
+  ( umask 077; printf '%s\n' "$token" > "$store/token" )
   echo "capsule: token stored for profile '$profile'"
 }
 

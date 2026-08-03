@@ -128,13 +128,17 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, command, "seed")) {
         const dir = args.next() orelse {
-            try err.interface.writeAll("usage: capsuled seed <dir> <issue> <title> <project-dir> [port]\n");
+            try err.interface.writeAll(
+                "usage: capsuled seed <dir> <issue> <title> <project-dir> [port] [theme] [editor-mode]\n",
+            );
             return 2;
         };
         const issue_short = args.next() orelse "";
         const title = args.next() orelse "";
         const project_dir = args.next() orelse "";
         const port = parsePort(args.next(), 8765);
+        const theme = orDefault(args.next(), "dark");
+        const editor_mode = orDefault(args.next(), "vim");
 
         const template_path = try std.fmt.allocPrint(
             arena,
@@ -149,6 +153,8 @@ pub fn main(init: std.process.Init) !u8 {
             .issue_title = title,
             .project_dir = project_dir,
             .mcp_port = port,
+            .theme = theme,
+            .editor_mode = editor_mode,
         }) catch |e| {
             try err.interface.print("capsuled: cannot seed {s}: {t}\n", .{ dir, e });
             return 1;
@@ -228,6 +234,13 @@ pub fn main(init: std.process.Init) !u8 {
 fn parsePort(text: ?[]const u8, fallback: u16) u16 {
     const t = text orelse return fallback;
     return std.fmt.parseInt(u16, t, 10) catch fallback;
+}
+
+/// Empty counts as absent: these arrive from bash, where an unset profile value is an
+/// empty word rather than a missing one.
+fn orDefault(text: ?[]const u8, fallback: []const u8) []const u8 {
+    const t = text orelse return fallback;
+    return if (t.len > 0) t else fallback;
 }
 
 test {

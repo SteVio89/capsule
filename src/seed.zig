@@ -12,26 +12,56 @@ pub const Run = struct {
     issue_title: []const u8,
     project_dir: []const u8,
     mcp_port: u16,
+    /// claude's interface preferences, stored per profile on the host. The defaults are
+    /// what the first-run wizard would otherwise stop to ask for.
+    theme: []const u8 = "dark",
+    editor_mode: []const u8 = "vim",
 };
 
-/// The MCP server entry, written to `.claude.json` in the run's agent-state directory —
-/// user scope, not a `.mcp.json` at the project root, which would put capsule's own
-/// configuration inside the user's repository.
-pub fn mcpConfig(arena: std.mem.Allocator, run: Run) ![]const u8 {
-    return std.fmt.allocPrint(arena,
-        \\{{
-        \\  "mcpServers": {{
-        \\    "capsule": {{
-        \\      "type": "http",
-        \\      "url": "http://localhost:{d}/mcp",
-        \\      "headers": {{
-        \\        "Authorization": "Bearer ${{CAPSULE_RUN_TOKEN}}"
-        \\      }}
-        \\    }}
-        \\  }}
-        \\}}
-        \\
-    , .{run.mcp_port});
+/// The run's whole `.claude.json`: the MCP server entry, plus the flags that keep claude
+/// from opening its first-run wizard.
+///
+/// The MCP server is configured at user scope rather than as a `.mcp.json` at the project
+/// root, which would put capsule's own configuration inside the user's repository.
+///
+/// The flags are here because the tree is rebuilt from scratch on every run, so a
+/// container that clicked through the wizard last time meets it again on the next one,
+/// with nobody at the keyboard to answer. `hasCompletedOnboarding` and `theme` cover the
+/// global screens; the `projects` entry covers the trust dialog, which claude keys by the
+/// directory it is started in — `project_dir`, where the replica is mounted.
+pub fn claudeJson(arena: std.mem.Allocator, run: Run) ![]const u8 {
+    var headers: std.json.ObjectMap = .empty;
+    try headers.put(arena, "Authorization", .{ .string = "Bearer ${CAPSULE_RUN_TOKEN}" });
+
+    var server: std.json.ObjectMap = .empty;
+    try server.put(arena, "type", .{ .string = "http" });
+    try server.put(arena, "url", .{
+        .string = try std.fmt.allocPrint(arena, "http://localhost:{d}/mcp", .{run.mcp_port}),
+    });
+    try server.put(arena, "headers", .{ .object = headers });
+
+    var servers: std.json.ObjectMap = .empty;
+    try servers.put(arena, "capsule", .{ .object = server });
+
+    var project: std.json.ObjectMap = .empty;
+    try project.put(arena, "hasTrustDialogAccepted", .{ .bool = true });
+    try project.put(arena, "hasCompletedProjectOnboarding", .{ .bool = true });
+
+    var projects: std.json.ObjectMap = .empty;
+    try projects.put(arena, run.project_dir, .{ .object = project });
+
+    var root: std.json.ObjectMap = .empty;
+    try root.put(arena, "hasCompletedOnboarding", .{ .bool = true });
+    try root.put(arena, "theme", .{ .string = run.theme });
+    try root.put(arena, "editorMode", .{ .string = run.editor_mode });
+    try root.put(arena, "mcpServers", .{ .object = servers });
+    try root.put(arena, "projects", .{ .object = projects });
+
+    return std.json.Stringify.valueAlloc(
+        arena,
+        std.json.Value{ .object = root },
+        .{ .whitespace = .indent_2 },
+    );
 }
 
 /// Named the issue, told to fetch it. The body is deliberately *not* pasted in: fetching
@@ -166,7 +196,7 @@ pub fn writeTree(
     try cwd.createDirPath(io, dir);
     try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/hooks", .{dir}));
 
-    try writeFile(arena, io, dir, ".claude.json", try mcpConfig(arena, run), false);
+    try writeFile(arena, io, dir, ".claude.json", try claudeJson(arena, run), false);
     try writeFile(arena, io, dir, "settings.json", try mergeSettings(arena, user_template), false);
     try writeFile(arena, io, dir, "INSTRUCTIONS.md", try instructions(arena, run), false);
     try writeFile(arena, io, dir, "statusline.sh", statusline, true);
@@ -209,7 +239,7 @@ fn testArena() std.heap.ArenaAllocator {
 test "the mcp config names the http transport and carries no secret" {
     var a = testArena();
     defer a.deinit();
-    const config = try mcpConfig(a.allocator(), example);
+    const config = try claudeJson(a.allocator(), example);
 
     try testing.expect(std.mem.indexOf(u8, config, "\"type\": \"http\"") != null);
     try testing.expect(std.mem.indexOf(u8, config, "localhost:8765/mcp") != null);
@@ -218,6 +248,61 @@ test "the mcp config names the http transport and carries no secret" {
 
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a.allocator(), config, .{});
     try testing.expect(parsed.object.get("mcpServers").?.object.get("capsule") != null);
+}
+
+test "every wizard the agent cannot answer is pre-answered" {
+    var a = testArena();
+    defer a.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        a.allocator(),
+        try claudeJson(a.allocator(), example),
+        .{},
+    );
+
+    try testing.expect(parsed.object.get("hasCompletedOnboarding").?.bool);
+    try testing.expectEqualStrings("dark", parsed.object.get("theme").?.string);
+    try testing.expectEqualStrings("vim", parsed.object.get("editorMode").?.string);
+
+    // Keyed by the directory claude starts in, not by the run: a project entry filed
+    // under any other path leaves the trust dialog armed.
+    const project = parsed.object.get("projects").?.object.get(example.project_dir).?.object;
+    try testing.expect(project.get("hasTrustDialogAccepted").?.bool);
+    try testing.expect(project.get("hasCompletedProjectOnboarding").?.bool);
+}
+
+test "the profile's theme and editor mode reach the config" {
+    var a = testArena();
+    defer a.deinit();
+    var run = example;
+    run.theme = "light";
+    run.editor_mode = "normal";
+
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        a.allocator(),
+        try claudeJson(a.allocator(), run),
+        .{},
+    );
+    try testing.expectEqualStrings("light", parsed.object.get("theme").?.string);
+    try testing.expectEqualStrings("normal", parsed.object.get("editorMode").?.string);
+}
+
+test "a project path with json metacharacters stays one key" {
+    var a = testArena();
+    defer a.deinit();
+    var run = example;
+    run.project_dir = "/home/agent/we\"ird\\path";
+
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        a.allocator(),
+        try claudeJson(a.allocator(), run),
+        .{},
+    );
+    const projects = parsed.object.get("projects").?.object;
+    try testing.expectEqual(@as(usize, 1), projects.count());
+    try testing.expect(projects.get(run.project_dir) != null);
 }
 
 test "policy wins over the user's template" {
