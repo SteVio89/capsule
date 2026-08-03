@@ -21,16 +21,22 @@ pub const Config = struct {
 
 /// The detached `podman run` for an agent session.
 ///
+/// `-d -t`, never `-i`. The PTY `-t` allocates lives on the VM, and `tmux new-session`
+/// needs one to attach to; without it tmux exits "not a terminal" and the container
+/// with it. `-i` is the dangerous one: it would wire stdin to the ssh client that
+/// started the run, tying the session to the connection expected to drop.
+///
 /// `--network=host` puts the container on the VM's loopback, where the reverse tunnel
 /// lands; `--env-file` keeps the token out of the VM's process table.
 pub fn podmanArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(arena, &.{
-        "podman",           "run",
-        "-d",               "--name",
-        cfg.container_name, "--security-opt",
-        "label=disable",    "--network=host",
-        "--env-file",       cfg.env_file,
+        "podman",         "run",
+        "-d",             "-t",
+        "--name",         cfg.container_name,
+        "--security-opt", "label=disable",
+        "--network=host", "--env-file",
+        cfg.env_file,
     });
 
     try args.appendSlice(arena, &.{
@@ -150,14 +156,16 @@ fn joined(arena: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     return std.mem.join(arena, " ", argv);
 }
 
-test "the container is detached, named, and on the host network" {
+test "the container is detached, has a terminal, is named, and is on the host network" {
     var a = testArena();
     defer a.deinit();
     const line = try joined(a.allocator(), try podmanArgs(a.allocator(), example));
 
     try testing.expect(std.mem.indexOf(u8, line, " -d ") != null);
+    try testing.expect(std.mem.indexOf(u8, line, " -t ") != null);
     try testing.expect(std.mem.indexOf(u8, line, "--name capsule-019fb1ce23cd") != null);
     try testing.expect(std.mem.indexOf(u8, line, "--network=host") != null);
+    try testing.expect(std.mem.indexOf(u8, line, " -i ") == null);
     try testing.expect(std.mem.indexOf(u8, line, " -it ") == null);
 }
 
