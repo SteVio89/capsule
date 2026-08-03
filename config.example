@@ -1,24 +1,30 @@
 # capsule config — copy to ~/.config/capsule/config
 # Sourced as shell script. Anything set here wins over the defaults below.
 
-# Projects must live under this directory; capsule refuses to start anywhere else.
-CAPSULE_ROOT="$HOME/code"
-
-# Where the agent runs. Point this at a physical Linux box and `capsule vm` becomes
-# unnecessary — everything else keeps working.
+# Where the agent runs. Point this at a physical Linux box and `capsule vm start` becomes
+# unnecessary — everything else keeps working, though `vm start`, `stop`, `disk` and
+# `destroy` then refuse: that machine isn't capsule's to boot or erase.
 CAPSULE_VM_HOST="core@localhost"
 CAPSULE_VM_PORT=2222
 
 # Container image and the agent user's home inside it. The default is the published
-# multi-arch image; podman pulls it on first use. `capsule image` builds it locally
+# multi-arch image; podman pulls it on first use. `capsule image build` builds it locally
 # under the same tag, so a local build always wins.
 CAPSULE_IMAGE="ghcr.io/stevio89/capsule:latest"
 CAPSULE_CONTAINER_HOME="/home/agent"
 
-# The branch the agent commits on, in the VM's replica of your repo.
-CAPSULE_BRANCH="capsule"
+# The port the agent reaches capsuled on. One shared port for every run — the per-run
+# token says who is calling, so there is no port registry. The daemon holds a reverse ssh
+# tunnel from the VM's loopback to this port on the host; nothing is ever bound on a real
+# network interface. Stay well above 1024: rootless podman cannot bind lower.
+CAPSULE_MCP_PORT=8765
 
-# `capsule vm` only — qemu on an aarch64 host.
+# How often capsuled refreshes its picture of the VM, in seconds. One batched ssh call per
+# tick, multiplexed over the shared master, so this is cheap — but these facts change on a
+# human timescale and there is nothing to gain from going faster.
+CAPSULE_POLL_INTERVAL=3
+
+# `capsule vm start` only — qemu on an aarch64 host.
 CAPSULE_SSH_KEY="$HOME/.ssh/id_ed25519.pub"
 CAPSULE_DATA="$HOME/.local/share/capsule"
 CAPSULE_VM_CPUS=4

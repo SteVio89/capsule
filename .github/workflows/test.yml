@@ -11,6 +11,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # shellcheck ships preinstalled on GitHub's ubuntu runners.
-      - run: shellcheck bin/capsule test/capsule-test.sh
+      - run: shellcheck bin/capsule test/capsule-test.sh test/capsuled-test.sh
+      - run: shellcheck -s sh src/assets/hooks/*.sh src/assets/statusline.sh
       - run: bash test/capsule-test.sh
+
+  zig:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - run: nix develop --command zig fmt --check src build.zig
+      - run: nix develop --command zig build test
+      - run: nix develop --command sh -c 'zig build && bash test/capsuled-test.sh'
+      - run: nix build .#capsuled

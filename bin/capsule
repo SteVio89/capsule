@@ -5,7 +5,6 @@ conf="${XDG_CONFIG_HOME:-$HOME/.config}/capsule/config"
 # shellcheck source=/dev/null
 [[ -f $conf ]] && source "$conf"
 
-# Resolve through symlinks: `ln -s .../capsule ~/.local/bin/capsule` must still find share/.
 self_src="${BASH_SOURCE[0]}"
 while [[ -L $self_src ]]; do
   self_dir="$(cd "$(dirname "$self_src")" && pwd)"
@@ -14,40 +13,66 @@ while [[ -L $self_src ]]; do
 done
 self_dir="$(cd "$(dirname "$self_src")" && pwd)"
 
-: "${CAPSULE_ROOT:=$HOME/code}"
 : "${CAPSULE_VM_HOST:=core@localhost}"
 : "${CAPSULE_VM_PORT:=2222}"
 : "${CAPSULE_IMAGE:=ghcr.io/stevio89/capsule:latest}"
 : "${CAPSULE_CONTAINER_HOME:=/home/agent}"
-: "${CAPSULE_BRANCH:=capsule}"
 : "${CAPSULE_DATA:=${XDG_DATA_HOME:-$HOME/.local/share}/capsule}"
 : "${CAPSULE_SSH_KEY:=$HOME/.ssh/id_ed25519.pub}"
 : "${CAPSULE_VM_CPUS:=4}"
 : "${CAPSULE_VM_MEM:=6144}"
 : "${CAPSULE_DISK_SIZE:=80G}"
 : "${CAPSULE_STREAM:=stable}"
+: "${CAPSULE_MCP_PORT:=8765}"
 : "${CAPSULE_SRC:=$(cd "$self_dir/.." && pwd)}"
 : "${CAPSULE_SHARE:=$CAPSULE_SRC/share}"
 
 die() { echo "capsule: $*" >&2; exit 1; }
 
-# Every VM path splits CAPSULE_VM_HOST into ssh user (before @) and host (after @). A
-# bare host would make `%%@*` return the whole string as the "user" and silently build
-# wrong replica paths, so require the user@host form up front.
 [[ $CAPSULE_VM_HOST == *@* ]] || die "CAPSULE_VM_HOST must be user@host (got '$CAPSULE_VM_HOST')"
 
-in_container() { [[ -n ${CAPSULE_PROFILE:-} ]]; }
+command -v jq >/dev/null 2>&1 || die "jq is required — install it, or use the Nix package which wires it in"
+
+# CAPSULE_IN_CAPSULE marks any container capsule started; CAPSULE_PROJECT_DIR marks a run
+# inside one, and a login container has only the first. Two variables, two jobs.
+in_container() { [[ -n ${CAPSULE_IN_CAPSULE:-} ]]; }
 host_only() {
-  if in_container; then die "'$1' runs on the host, not inside the capsule"; fi
+  if in_container; then die "'capsule $*' runs on the host, not inside the capsule"; fi
 }
 
-# accept-new adds an unknown host key without prompting, but still refuses a *changed*
-# one. git uses the same known_hosts, so it stays consistent with plain `git push vm`.
-ssh_vm() { ssh -o StrictHostKeyChecking=accept-new -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST" "$@"; }
+vm_is_local() {
+  case "${CAPSULE_VM_HOST##*@}" in localhost | 127.0.0.1 | ::1) return 0 ;; *) return 1 ;; esac
+}
+qemu_only() {
+  vm_is_local && return 0
+  die "'capsule $*' drives the local qemu VM, but CAPSULE_VM_HOST is $CAPSULE_VM_HOST — manage that machine directly"
+}
 
-# The named volume shadows /nix from any new image, so a new image means dropping it.
-# It goes first: while a capsule is running the volume is in use and podman refuses,
-# which aborts before anything is pulled or built rather than after.
+# One multiplexed connection for every ssh: a fresh handshake costs 200-300ms and a single
+# command makes several. %C hashes the connection, because a control socket path is capped
+# at 108 bytes.
+ctl_dir="${XDG_RUNTIME_DIR:-$CAPSULE_DATA}/capsule"
+ssh_opts=(
+  -o StrictHostKeyChecking=accept-new
+  -o ControlMaster=auto
+  -o "ControlPath=$ctl_dir/cm-%C"
+  -o ControlPersist=10m
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=3
+  -p "$CAPSULE_VM_PORT"
+)
+
+ssh_ready() { [[ -d $ctl_dir ]] || { mkdir -p "$ctl_dir" && chmod 700 "$ctl_dir"; }; }
+
+# shellcheck disable=SC2029  # callers pass a remote command that is meant to expand here
+ssh_vm() { ssh_ready; ssh "${ssh_opts[@]}" "$CAPSULE_VM_HOST" "$@"; }
+
+vm_home() {
+  # shellcheck disable=SC2016  # $HOME must expand on the VM, not here — that is the point
+  [[ -n ${_vm_home:-} ]] || _vm_home=$(ssh_vm 'printf %s "$HOME"')
+  printf '%s' "$_vm_home"
+}
+
 drop_nix_volume() {
   ssh_vm "if podman volume exists capsule-nix; then podman volume rm capsule-nix; fi"
 }
@@ -56,16 +81,309 @@ vm_running() {
   timeout 2 bash -c "echo > /dev/tcp/${CAPSULE_VM_HOST##*@}/${CAPSULE_VM_PORT}" 2>/dev/null
 }
 
+# Never boots anything: booting takes minutes and is an explicit act.
 vm_reachable() {
-  vm_running || die "VM not reachable on ${CAPSULE_VM_HOST}:${CAPSULE_VM_PORT} — run 'capsule vm'"
+  vm_running && return 0
+  if vm_is_local; then
+    die "VM not reachable on ${CAPSULE_VM_HOST}:${CAPSULE_VM_PORT} — run 'capsule vm start'"
+  fi
+  die "$CAPSULE_VM_HOST is not reachable on port $CAPSULE_VM_PORT — start that machine, or check ssh"
 }
 
-# ---------------------------------------------------------------- project
+need_daemon() {
+  capsuled ping >/dev/null 2>&1 \
+    || die "capsuled is not running — run 'capsule daemon start'"
+}
+
+service_manager() {
+  if [[ $(uname -s) == Darwin ]] && launchctl print "gui/$(id -u)/dev.capsule.capsuled" >/dev/null 2>&1; then
+    echo launchd
+  elif command -v systemctl >/dev/null 2>&1 && systemctl --user cat capsuled.service >/dev/null 2>&1; then
+    echo systemd
+  else
+    echo none
+  fi
+}
+
+cmd_daemon_start() {
+  host_only daemon start
+  if capsuled ping >/dev/null 2>&1; then
+    echo "capsule: daemon already running"; return 0
+  fi
+  case "$(service_manager)" in
+    launchd) launchctl kickstart "gui/$(id -u)/dev.capsule.capsuled" ;;
+    systemd) systemctl --user start capsuled.service ;;
+    none)
+      setsid capsuled daemon >/dev/null 2>&1 &
+      ;;
+  esac
+  local waited=0
+  while (( waited < 10 )); do
+    capsuled ping >/dev/null 2>&1 && { echo "capsule: daemon started"; return 0; }
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  die "daemon did not come up — try 'capsuled daemon' in the foreground to see why"
+}
+
+cmd_daemon_stop() {
+  host_only daemon stop
+  case "$(service_manager)" in
+    launchd) launchctl kill TERM "gui/$(id -u)/dev.capsule.capsuled" ;;
+    systemd) systemctl --user stop capsuled.service ;;
+    none)    capsuled daemon.stop >/dev/null 2>&1 || true ;;
+  esac
+  echo "capsule: daemon stopped"
+}
+
+cmd_daemon_status() {
+  host_only daemon status
+  if ! capsuled daemon.status 2>/dev/null; then
+    echo "not running — 'capsule daemon start'"
+    return 1
+  fi
+}
+
+# `--git-common-dir` and not `--show-toplevel`, or two worktrees of one repository would
+# fork into separate backlogs. `pwd -P` resolves symlinks, which Zig 0.16 cannot.
+project_params() {
+  local gcd cwd
+  gcd=$(git rev-parse --git-common-dir 2>/dev/null) \
+    || die "$PWD is not a git repository"
+  cwd=$(pwd -P)
+  [[ $gcd == /* && -d $gcd ]] && gcd=$(cd "$gcd" && pwd -P)
+  printf '{"git_common_dir":%s,"cwd":%s' "$(json_string "$gcd")" "$(json_string "$cwd")"
+}
+
+json_string() {
+  jq -n --arg s "$1" '$s'
+}
+
+cmd_project_add() {
+  host_only project add
+  need_daemon
+  local profile=default
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile) profile="${2:-}"; shift 2 ;;
+      *) die "usage: capsule project add [--profile <name>]" ;;
+    esac
+  done
+  capsuled project.add "$(project_params),\"profile\":$(json_string "$profile")}"
+}
+
+cmd_project_list() {
+  host_only project list
+  need_daemon
+  capsuled project.list '{}'
+}
+
+cmd_project_profile() {
+  host_only project profile
+  need_daemon
+  [[ $# -eq 1 ]] || die "usage: capsule project profile <name>"
+  capsuled project.profile "$(project_params),\"profile\":$(json_string "$1")}"
+}
+
+cmd_project_rm() {
+  host_only project rm
+  need_daemon
+  local force=false
+  [[ ${1:-} == --force ]] && force=true
+  capsuled project.rm "$(project_params),\"force\":$force}"
+}
+
+pick_issue() { # pick_issue [state]
+  local filter="" listing params rows
+  params=$(project_params)
+  [[ -n ${1:-} ]] && filter=",\"state\":$(json_string "$1")"
+  listing=$(capsuled issue.list "$params$filter}") || exit 1
+
+  rows=$(jq -r '.[] | [.short, .state, .title] | @tsv' <<<"$listing")
+  [[ -n $rows ]] || die "no issues here yet — 'capsule issue new <title>'"
+
+  printf '%s\n' "$rows" \
+    | fzf --with-nth=2.. --delimiter=$'\t' \
+          --preview "capsuled issue.get '${params},\"id\":\"{1}\"}'" \
+          --preview-window=right:60% \
+    | cut -f1
+}
+
+issue_id_or_pick() { # issue_id_or_pick [id] [state]
+  if [[ -n ${1:-} ]]; then printf '%s' "$1"; else pick_issue "${2:-}"; fi
+}
+
+cmd_issue_new() {
+  host_only issue new
+  need_daemon
+  [[ $# -gt 0 ]] || die "usage: capsule issue new <title>"
+  local title="$*" body
+  body=$(capsuled edit "" "<!-- describe the issue. save to create it, empty aborts. -->") \
+    || { echo "aborted"; return 1; }
+  capsuled issue.new "$(project_params),\"title\":$(json_string "$title"),\"body\":$(json_string "$body")}"
+}
+
+cmd_issue_list() {
+  host_only issue list
+  need_daemon
+  local filter=""
+  [[ -n ${1:-} ]] && filter=",\"state\":$(json_string "$1")"
+  capsuled issue.list "$(project_params)$filter}"
+}
+
+cmd_issue_edit() {
+  host_only issue edit
+  need_daemon
+  local id; id=$(issue_id_or_pick "${1:-}") || exit 1
+  [[ -n $id ]] || { echo "nothing selected"; return 1; }
+
+  local current token body
+  current=$(capsuled issue.get "$(project_params),\"id\":$(json_string "$id")}") || exit 1
+  token=$(jq -r '.last_event_id' <<<"$current")
+  body=$(capsuled edit "$(jq -r '.body' <<<"$current")" \
+                       "<!-- edit the body. unchanged is a no-op, empty aborts. -->") \
+    || { echo "unchanged"; return 0; }
+
+  capsuled issue.edit \
+    "$(project_params),\"id\":$(json_string "$id"),\"body\":$(json_string "$body"),\"last_event_id\":$(json_string "$token")}"
+}
+
+cmd_issue_rename() {
+  host_only issue rename
+  need_daemon
+  local id
+  if [[ $# -ge 2 ]]; then
+    id="$1"; shift
+  elif [[ $# -eq 1 ]]; then
+    id=$(pick_issue) || exit 1
+    [[ -n $id ]] || { echo "nothing selected"; return 1; }
+  else
+    die "usage: capsule issue rename [id] <title>"
+  fi
+  capsuled issue.rename "$(project_params),\"id\":$(json_string "$id"),\"title\":$(json_string "$*")}"
+}
+
+cmd_issue_comment() {
+  host_only issue comment
+  need_daemon
+  local id text; id=$(issue_id_or_pick "${1:-}") || exit 1
+  text=$(capsuled edit "" "<!-- your note. save to add it, empty aborts. -->") \
+    || { echo "aborted"; return 1; }
+  capsuled issue.comment "$(project_params),\"id\":$(json_string "$id"),\"text\":$(json_string "$text")}"
+}
+
+cmd_issue_triage() {
+  host_only issue triage
+  need_daemon
+
+  local loaded count buffer edited
+  loaded=$(capsuled issue.triage.load "$(project_params)}") || exit 1
+  count=$(jq -r '.count' <<<"$loaded")
+  (( count > 0 )) || { echo "nothing to triage"; return 0; }
+
+  buffer=$(jq -r '.buffer' <<<"$loaded")
+
+  local attempt=0
+  while (( attempt < 3 )); do
+    edited=$(capsuled edit "$buffer" "") || { echo "unchanged — nothing applied"; return 0; }
+    local result
+    if result=$(capsuled issue.triage.apply \
+                  "$(project_params),\"buffer\":$(json_string "$edited")}" 2>&1); then
+      echo "$result"
+      return 0
+    fi
+    echo "$result" >&2
+    buffer="<!-- $result -->
+$edited"
+    attempt=$((attempt + 1))
+  done
+  die "gave up after three malformed buffers — nothing was applied"
+}
+
+cmd_issue_archive() {
+  host_only issue archive
+  need_daemon
+  local id reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m) reason="${2:-}"; shift 2 ;;
+      *)  id="$1"; shift ;;
+    esac
+  done
+  [[ -n $reason ]] || die "usage: capsule issue archive [id] -m <reason>"
+  id=$(issue_id_or_pick "${id:-}") || exit 1
+  capsuled issue.archive "$(project_params),\"id\":$(json_string "$id"),\"reason\":$(json_string "$reason")}"
+
+  offer_memory_review
+}
+
+cmd_issue_reopen() {
+  host_only issue reopen
+  need_daemon
+  local id; id=$(issue_id_or_pick "${1:-}" archived) || exit 1
+  capsuled issue.reopen "$(project_params),\"id\":$(json_string "$id")}"
+  echo "work resumes on the branch it already has"
+}
+
+offer_memory_review() {
+  local loaded proposals
+  loaded=$(capsuled memory.review.load "$(project_params)}" 2>/dev/null) || return 0
+  proposals=$(jq -r '.proposals' <<<"$loaded")
+  (( ${proposals:-0} > 0 )) || return 0
+  cmd_memory_review
+}
+
+cmd_memory_review() {
+  host_only memory review
+  need_daemon
+
+  local loaded buffer edited result
+  loaded=$(capsuled memory.review.load "$(project_params)}") || exit 1
+  buffer=$(jq -r '.buffer' <<<"$loaded")
+
+  local attempt=0
+  while (( attempt < 3 )); do
+    edited=$(capsuled edit "$buffer" "") || { echo "unchanged — nothing applied"; return 0; }
+    if result=$(capsuled memory.review.apply \
+                  "$(project_params),\"buffer\":$(json_string "$edited")}" 2>&1); then
+      echo "$result"
+      return 0
+    fi
+    echo "$result" >&2
+    buffer="<!-- $result -->
+$edited"
+    attempt=$((attempt + 1))
+  done
+  die "gave up after three refused buffers — nothing was applied"
+}
+
+cmd_memory_list() {
+  host_only memory list
+  need_daemon
+  capsuled memory.list "$(project_params)}"
+}
+
+cmd_memory_new() {
+  host_only memory new
+  need_daemon
+  local body
+  body=$(capsuled edit "" \
+    "<!-- one to three sentences: a decision and why, a trap, an approach that failed. -->
+<!-- not what the code does, not what happened — those are the code and the event log. -->") \
+    || { echo "aborted"; return 1; }
+  capsuled memory.new "$(project_params),\"body\":$(json_string "$body")}"
+}
+
+cmd_board() {
+  host_only board
+  need_daemon
+  local params=""
+  git rev-parse --git-common-dir >/dev/null 2>&1 && params="$(project_params)}"
+  exec capsuled board "$params"
+}
 
 template() { echo "$CAPSULE_SHARE/templates"; }
 
-# Rewrite flake.nix through a sibling temp file, so the replacement is a rename(2)
-# on the same filesystem rather than a copy.
 rewrite_flake() {
   local tmp; tmp=$(mktemp ./flake.nix.XXXXXX) || die "cannot write to $PWD"
   if "$@" < flake.nix > "$tmp"; then
@@ -85,9 +403,6 @@ inject_pkgs() {
   '
 }
 
-# Drop any injected package line whose trimmed content exactly equals a named package.
-# Literal compare (not `~` regex): `capsule rm python3Packages.foo` must not also match
-# python3PackagesXfoo, and names with regex metachars must not silently over-match.
 strip_pkgs() {
   # shellcheck disable=SC2016  # single quotes protect the awk program, not shell vars
   rewrite_flake awk -v pkgs="$*" '
@@ -99,14 +414,14 @@ strip_pkgs() {
   '
 }
 
-# True when $1 is already an injected package: an indented line equal to the name.
 pkg_present() {
   awk -v p="$1" '
     { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line); if (line == p) found = 1 }
     END { exit !found }' flake.nix
 }
 
-cmd_init() {
+cmd_env_init() {
+  host_only env init
   [[ -f flake.nix ]] && die "flake.nix already exists — refusing to overwrite"
   local helpers lang="${1:-}" name="${2:-}" project
   helpers="$(template)"
@@ -130,9 +445,9 @@ cmd_init() {
   direnv allow
 }
 
-cmd_add() {
-  [[ -f flake.nix ]] || die "no flake.nix — run 'capsule init' first"
-  [[ $# -gt 0 ]] || die "usage: capsule add <pkg>..."
+cmd_env_add() {
+  [[ -f flake.nix ]] || die "no flake.nix — run 'capsule env init' first"
+  [[ $# -gt 0 ]] || die "usage: capsule env add <pkg>..."
   local p; local -a fresh=()
   for p in "$@"; do
     case " ${fresh[*]:-} " in *" $p "*) continue ;; esac   # duplicate within this batch
@@ -147,35 +462,20 @@ cmd_add() {
   direnv reload
 }
 
-cmd_rm() {
+cmd_env_rm() {
   [[ -f flake.nix ]] || die "no flake.nix here"
-  [[ $# -gt 0 ]] || die "usage: capsule rm <pkg>..."
+  [[ $# -gt 0 ]] || die "usage: capsule env rm <pkg>..."
   strip_pkgs "$@"
   direnv reload
 }
 
-cmd_update() {
+cmd_env_update() {
   [[ -f flake.nix ]] || die "no flake.nix here"
   nix flake update && direnv reload
 }
 
-# ---------------------------------------------------------------- git handoff
+cmd_env_reload() { direnv reload; }
 
-need_remote() {
-  git remote get-url vm >/dev/null 2>&1 \
-    || die "no 'vm' remote — run 'capsule shell' once to bootstrap"
-}
-
-need_fetched() {
-  need_remote
-  git rev-parse --verify -q "vm/$CAPSULE_BRANCH" >/dev/null \
-    || die "no vm/$CAPSULE_BRANCH — run 'capsule fetch' first"
-}
-
-# The branch we treat as "main" for the post-merge replica re-sync. Only a merge into it
-# re-syncs the replica; merging into a feature branch shouldn't move the agent's base.
-# Prefer the remote's default (origin/HEAD), fall back to main/master, else the current
-# branch (so the guard is a no-op in a repo with none). Override with CAPSULE_MAIN_BRANCH.
 default_branch() {
   local d
   if d=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); then
@@ -187,59 +487,142 @@ default_branch() {
   git rev-parse --abbrev-ref HEAD
 }
 
-cmd_push()   { host_only push;   need_remote; git push vm "HEAD:$CAPSULE_BRANCH"; }
-cmd_fetch()  { host_only fetch;  need_remote; git fetch vm; }
-cmd_review() { host_only review; need_fetched; git log -p --reverse "HEAD..vm/$CAPSULE_BRANCH"; }
+need_remote() {
+  git remote get-url vm >/dev/null 2>&1 \
+    || die "no 'vm' remote — run 'capsule run start' once to bootstrap"
+}
 
-cmd_merge() {
-  host_only merge
-  need_fetched
-  local n here
-  n=$(git rev-list --count "HEAD..vm/$CAPSULE_BRANCH")
-  here=$(git rev-parse --abbrev-ref HEAD)
-  if (( n == 0 )); then
-    echo "nothing to merge — vm/$CAPSULE_BRANCH has no commits beyond $here"
+issue_branch() { # issue_branch <issue-short>
+  local full
+  full=$(capsuled issue.get "$(project_params),\"id\":$(json_string "$1")}" | jq -r '.id')
+  [[ -n $full && $full != null ]] || die "no such issue: $1"
+  printf 'capsule/%s' "$full"
+}
+
+cmd_run_push()  { host_only run push;  need_remote; git push vm "HEAD:$(issue_branch "$(issue_id_or_pick "${1:-}")")"; }
+cmd_run_fetch() { host_only run fetch; need_remote; git fetch -q vm && echo "capsule: fetched"; }
+
+cmd_run_review() {
+  host_only run review
+  need_daemon
+  need_remote
+  local issue; issue=$(issue_id_or_pick "${1:-}" ready_for_review) || exit 1
+  [[ -n $issue ]] || { echo "nothing selected"; return 1; }
+
+  local branch; branch=$(issue_branch "$issue")
+  git fetch -q vm || die "could not fetch from the replica"
+  git rev-parse --verify -q "vm/$branch" >/dev/null \
+    || die "the replica has no $branch — has this issue been dispatched?"
+
+  if ! command -v tuicr >/dev/null 2>&1 || [[ ! -t 1 ]]; then
+    git log -p --reverse "HEAD..vm/$branch"
+    return
+  fi
+
+  local exported
+  exported=$(tuicr --no-update-check --stdout -r "HEAD..vm/$branch")
+  if [[ -z $exported ]]; then
+    echo "${_d}no comments exported — press y in tuicr to hand them back to the issue${_r}"
     return 0
   fi
-  echo "merging $n commit(s) from vm/$CAPSULE_BRANCH into $here:"
-  git log --oneline --reverse "HEAD..vm/$CAPSULE_BRANCH"
-  echo
-  git diff --stat "HEAD...vm/$CAPSULE_BRANCH"
-  echo
-  # Read from the terminal, never stdin: `echo y | capsule merge` must not confirm.
-  local ans
-  read -r -n1 -p "merge these? [y/N] " ans < /dev/tty || die "not a terminal"
-  echo
-  [[ $ans == [yY] ]] || { echo "aborted"; return 1; }
-  git merge --no-ff "vm/$CAPSULE_BRANCH"
 
-  # Re-sync the replica so the agent's next run is based on this merge, not the stale tip
-  # it committed on — otherwise a long-lived container keeps re-basing on old state and
-  # never sees host-side changes. The merge commit descends from vm/$CAPSULE_BRANCH, so
-  # this push is a fast-forward; receive.denyCurrentBranch=updateInstead then advances the
-  # replica's mounted working tree in place. Best-effort: the merge is already committed,
-  # so a rejected push (agent's tree dirty mid-task, or the replica advanced past what we
-  # merged) must warn, never fail. Guarded to the default branch so merging into a feature
-  # branch doesn't move the agent's base.
-  local main_branch="${CAPSULE_MAIN_BRANCH:-$(default_branch)}"
+  printf '%s\n\n' "$exported"
+  local ans
+  read -r -n1 -p "attach to the issue for the agent's next run? [y/N] " ans < /dev/tty; echo
+  [[ $ans == [yY] ]] || { echo "not attached"; return 0; }
+  capsuled issue.comment "$(project_params),\"id\":$(json_string "$issue"),\"text\":$(json_string "$exported")}" \
+    && echo "attached"
+}
+
+cmd_run_merge() {
+  host_only run merge
+  need_daemon
+  need_remote
+
+  local issue; issue=$(issue_id_or_pick "${1:-}" ready_for_review) || exit 1
+  [[ -n $issue ]] || { echo "nothing selected"; return 1; }
+
+  local branch here n
+  branch=$(issue_branch "$issue")
+  git fetch -q vm || die "could not fetch from the replica"
+  git rev-parse --verify -q "vm/$branch" >/dev/null || die "the replica has no $branch"
+
+  here=$(git rev-parse --abbrev-ref HEAD)
+  local before; before=$(git rev-parse HEAD)
+  n=$(git rev-list --count "HEAD..vm/$branch")
+  if (( n == 0 )); then
+    echo "nothing to merge — vm/$branch has no commits beyond $here"
+    return 0
+  fi
+
+  echo "squashing $n commit(s) from vm/$branch into $here:"
+  git log --oneline --reverse "HEAD..vm/$branch"
+  echo
+  git diff --stat "HEAD...vm/$branch"
+  echo
+
+  local title message
+  title=$(capsuled issue.get "$(project_params),\"id\":$(json_string "$issue")}" | jq -r '.title')
+  message=$(capsuled edit "$title" \
+    "<!-- the commit message for this merge. it is authored by you, not generated. empty aborts. -->")
+  case $? in
+    0) ;;
+    3) message="$title" ;;
+    *) echo "aborted"; return 1 ;;
+  esac
+
+  git merge --squash "vm/$branch" || die "the squash did not apply cleanly — resolve it, then commit"
+  git commit -q -m "$message" || die "nothing was committed"
+  echo "merged as $(git rev-parse --short HEAD)"
+
+  capsuled issue.merge "$(project_params),\"id\":$(json_string "$issue")}" >/dev/null \
+    || echo "capsule: merged, but the issue could not be marked done" >&2
+
+  flag_stale_memories "$before" "$here"
+  resync_replica "$here"
+
+  offer_memory_review
+}
+
+flag_stale_memories() { # flag_stale_memories <before-sha> <branch>
+  local before="$1" paths json suspect
+  paths=$(git diff --name-status --diff-filter=DR "$before..HEAD" 2>/dev/null | cut -f2) || return 0
+  [[ -n $paths ]] || return 0
+
+  json=$(jq -R . <<<"$paths" | jq -cs .)
+  suspect=$(capsuled memory.stale "$(project_params),\"paths\":$json}" 2>/dev/null) || return 0
+  [[ $suspect == "[]" || -z $suspect ]] && return 0
+
+  echo
+  echo "these memories are anchored to files this merge removed or renamed:"
+  jq -r '.[] | "   \(.short)  \(.body)"' <<<"$suspect"
+  echo "   review them with 'capsule memory review'"
+}
+
+resync_replica() { # resync_replica <current-branch>
+  local here="$1" main_branch="${CAPSULE_MAIN_BRANCH:-$(default_branch)}"
   if [[ $here != "$main_branch" ]]; then
-    echo "on '$here' (not '$main_branch') — replica left as is; 'capsule push' to sync it"
-  elif git push vm "HEAD:$CAPSULE_BRANCH"; then
-    echo "replica synced — vm/$CAPSULE_BRANCH now at the merge"
+    echo "on '$here' (not '$main_branch') — replica left as is"
+    return 0
+  fi
+  vm_running || { echo "capsule: VM is down — the replica will be stale until the next run"; return 0; }
+
+  local replica; replica=$(capsuled project.get "$(project_params)}" | jq -r '.replica // empty')
+  [[ -n $replica ]] || return 0
+
+  git push -q vm "HEAD:$main_branch" || {
+    echo "capsule: merged, but the replica would not accept the push" >&2
+    return 0
+  }
+  if ssh_vm "git -C ~/capsule/$replica checkout -q $main_branch" 2>/dev/null; then
+    echo "replica synced — now on $main_branch"
   else
-    echo "capsule: merged, but the replica wasn't synced (agent tree busy, or ahead of" >&2
-    echo "         what we merged). run 'capsule push' once the agent is idle." >&2
+    echo "capsule: merged and pushed, but the replica would not switch to $main_branch." >&2
+    echo "         its working tree is probably dirty — 'capsule run attach' and commit or" >&2
+    echo "         stash there, or 'capsule vm ssh' to look." >&2
   fi
 }
 
-# ---------------------------------------------------------------- capsule
-
-# Seed the VM's git identity from the host, so the container's mounted ~/.gitconfig has a
-# user.name/email to commit with — set once here, not once per container. Only name/email
-# cross over, never the whole host config: a host-side gpgsign or an osxkeychain credential
-# helper would just make the agent's commits fail inside the container. A git identity
-# already set on the VM wins (so `capsule ssh git config --global ...` is never clobbered),
-# and a host with no identity is a silent no-op.
 seed_git_identity() {
   local name email
   name=$(git config --get user.name 2>/dev/null || true)
@@ -251,69 +634,176 @@ seed_git_identity() {
           [ -n '$email' ] && git config --global user.email '$email'; :"
 }
 
-cmd_shell() {
-  host_only shell
-  local profile="${1:-default}"
-  [[ "$profile" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid profile '$profile' (use [A-Za-z0-9_-])"
+ensure_replica() { # ensure_replica <replica-name> <branch>
+  local name="$1" branch="$2" remote_url
+  remote_url="ssh://${CAPSULE_VM_HOST}:${CAPSULE_VM_PORT}/home/${CAPSULE_VM_HOST%%@*}/capsule/$name"
 
-  local root="${CAPSULE_ROOT%/}" proj="$PWD" name
-  case "$proj/" in "$root"/*) ;; *) die "$proj is outside CAPSULE_ROOT ($root)" ;; esac
-  name="$(basename "$proj")"
-
-  vm_reachable
-  git -C "$proj" rev-parse --git-dir >/dev/null 2>&1 || die "$proj is not a git repository"
-
-  if ! ssh_vm "test -d ~/$name/.git"; then
+  if ! ssh_vm "test -d ~/capsule/$name/.git"; then
     echo "capsule: bootstrapping $name in VM"
-    ssh_vm "git init -q -b $CAPSULE_BRANCH ~/$name \
-      && git -C ~/$name config receive.denyCurrentBranch updateInstead"
-    git -C "$proj" remote get-url vm >/dev/null 2>&1 \
-      || git -C "$proj" remote add vm \
-           "ssh://${CAPSULE_VM_HOST}:${CAPSULE_VM_PORT}/home/${CAPSULE_VM_HOST%%@*}/$name"
-    git -C "$proj" push -q vm "HEAD:$CAPSULE_BRANCH"
+    ssh_vm "mkdir -p ~/capsule && git init -q ~/capsule/$name \
+      && git -C ~/capsule/$name config receive.denyCurrentBranch updateInstead"
   fi
 
-  seed_git_identity
+  # The replica having no remotes is what keeps agent commits off a shared one — a hook
+  # matching `git push` is defeated by any indirection. Checked on every start.
+  [[ -z "$(ssh_vm "git -C ~/capsule/$name remote")" ]] \
+    || die "replica ~/capsule/$name has git remotes — agent commits could escape; refusing"
 
-  printf '\n  capsule  profile=%s  project=%s\n\n' "$profile" "$name"
+  git remote get-url vm >/dev/null 2>&1 || git remote add vm "$remote_url"
+  git remote set-url vm "$remote_url"
 
-  local h="$CAPSULE_CONTAINER_HOME"
-  # The agent's git identity (user.name / user.email, aliases, …) comes from the VM's
-  # ~/.gitconfig, mounted read-only — so it's set once per VM, not once per container.
-  # home-manager writes the container's managed config to ~/.config/git/config (XDG),
-  # so ~/.gitconfig layers on top and its safe.directory=* survives. Set it once with
-  # `capsule ssh git config --global user.email ...`. The mount is added only when the
-  # VM actually has a ~/.gitconfig, else podman would create an empty dir in its place.
-  exec ssh -t -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST" \
-    "mkdir -p ~/.capsule/$profile/claude ~/.capsule/$profile/cursor ~/.capsule/cache \
-     && cd ~/$name || exit 1 ; \
-     git_mount=\$([ -f \"\$HOME/.gitconfig\" ] && echo \"-v \$HOME/.gitconfig:$h/.gitconfig:ro\") ; \
-     podman run --rm -it \
-       --security-opt label=disable \
-       -e DOCKER_HOST=unix:///run/podman.sock \
-       -e TESTCONTAINERS_RYUK_DISABLED=true \
-       -e TESTCONTAINERS_HOST_OVERRIDE=host.containers.internal \
-       -e CAPSULE_PROFILE=$profile \
-       -v capsule-nix:/nix \
-       -v /run/user/\$(id -u)/podman/podman.sock:/run/podman.sock \
-       -v ~/.capsule/cache:$h/.cache \
-       -v ~/.capsule/$profile/claude:$h/.claude \
-       -v ~/.capsule/$profile/cursor:$h/.config/cursor \
-       \$git_mount \
-       -v \"\$PWD:\$PWD\" -w \"\$PWD\" \
-       $CAPSULE_IMAGE"
+  git push -q vm "HEAD:$branch" || die "could not push $branch to the replica"
+  ssh_vm "git -C ~/capsule/$name checkout -q $branch" \
+    || die "the replica could not check out $branch — is its working tree dirty? 'capsule vm ssh' to look"
 }
 
-cmd_pull() {
-  host_only pull
+seed_to_vm() { # seed_to_vm <run-dir> <issue-short> <title> <project-dir> <run-token> <profile>
+  local run_dir="$1" issue="$2" title="$3" proj="$4" run_token="$5" profile="$6"
+  local local_seed oauth
+  local_seed=$(mktemp -d)
+  # shellcheck disable=SC2064  # expand run_dir now, not at trap time
+  trap "rm -rf '$local_seed'" RETURN
+
+  capsuled seed "$local_seed/claude" "$issue" "$title" "$proj" "$CAPSULE_MCP_PORT" \
+    || die "could not build the agent-state tree"
+
+  ssh_vm "rm -rf ~/$run_dir && mkdir -p ~/$run_dir"
+  tar czf - -C "$local_seed" claude | ssh_vm "tar xzf - -C ~/$run_dir"
+
+  oauth=""
+  local token_file="${XDG_CONFIG_HOME:-$HOME/.config}/capsule/profiles/$profile/token"
+  [[ -f $token_file ]] && oauth=$(<"$token_file")
+
+  {
+    [[ -n $run_token ]] && printf 'CAPSULE_RUN_TOKEN=%s\n' "$run_token"
+    [[ -n $oauth ]] && printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$oauth"
+    :
+  } | ssh_vm "umask 077 && cat > ~/$run_dir/env"
+}
+
+cmd_run_start() {
+  host_only run start
+  need_daemon
+
+  local project issue_arg="${1:-}"
+  project=$(capsuled project.get "$(project_params)}") \
+    || die "not a registered project — run 'capsule project add' here first"
+
+  local replica profile
+  replica=$(jq -r '.replica' <<<"$project")
+  profile=$(jq -r '.profile' <<<"$project")
+
+  vm_reachable
+
+  local issue; issue=$(issue_id_or_pick "$issue_arg" open) || exit 1
+  [[ -n $issue ]] || { echo "nothing selected"; return 1; }
+
+  local started
+  started=$(capsuled run.start "$(project_params),\"issue\":$(json_string "$issue")}") || exit 1
+
+  local run_id token container branch title issue_short
+  run_id=$(jq -r '.run' <<<"$started")
+  token=$(jq -r '.token' <<<"$started")
+  container=$(jq -r '.container' <<<"$started")
+  branch=$(jq -r '.branch' <<<"$started")
+  title=$(jq -r '.title' <<<"$started")
+  issue_short=$(jq -r '.issue' <<<"$started"); issue_short=${issue_short: -8}
+
+  ensure_replica "$replica" "$branch"
+
+  local run_dir=".capsule/runs/${run_id:0:12}"
+  local home; home=$(vm_home)
+  seed_to_vm "$run_dir" "$issue_short" "$title" "$home/capsule/$replica" "$token" "$profile"
+  seed_git_identity
+
+  printf '\n  capsule  %s  %s\n  %s\n\n' "$issue_short" "$title" "$branch"
+
+  local cmd
+  cmd=$(CAPSULE_IMAGE="$CAPSULE_IMAGE" capsuled container-cmd \
+          "$container" "$home/capsule/$replica" "$home/$run_dir/claude" \
+          "$home/$run_dir/env" "$profile" "$issue_short")
+
+  ssh_vm "eval $cmd" >/dev/null || die "the container did not start"
+  ssh_vm "rm -f ~/$run_dir/env"
+
+  cmd_run_attach
+}
+
+cmd_run_attach() {
+  host_only run attach
+  need_daemon
+  vm_reachable
+
+  local live container
+  live=$(capsuled run.list "$(project_params)}") || exit 1
+  container=$(jq -r 'map(select(.state == "active")) | first | .container // empty' <<<"$live")
+  [[ -n $container ]] || die "no run is live on this project — 'capsule run start' to begin one"
+
+  ssh_ready
+  local cmd; cmd=$(capsuled attach-cmd "$container")
+  ssh -t "${ssh_opts[@]}" "$CAPSULE_VM_HOST" "eval $cmd"
+
+  echo "capsule: detached — the agent is still running. 'capsule run attach' to return."
+}
+
+cmd_run_list() {
+  host_only run list
+  need_daemon
+  capsuled run.list "$(project_params)}"
+}
+
+cmd_login() {
+  host_only login
+  local profile="${1:-default}"
+  [[ "$profile" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid profile '$profile' (use [A-Za-z0-9_-])"
+  vm_reachable
+
+  local dir=".capsule/profiles/$profile"
+  ssh_vm "mkdir -p ~/$dir/claude"
+
+  cat <<EOF
+
+  capsule login — profile '$profile'
+
+  In the container, run:
+
+      claude setup-token
+
+  and follow the prompts. Copy the token it prints, then exit (ctrl-d), and paste it
+  when asked. capsule stores it on this machine and injects it per run; it is never
+  written into the container's filesystem.
+
+EOF
+
+  ssh_ready
+  ssh -t "${ssh_opts[@]}" "$CAPSULE_VM_HOST" \
+    "podman run --rm -it --security-opt label=disable \
+       -e CAPSULE_IN_CAPSULE=1 -e CAPSULE_PROFILE=$profile \
+       -v capsule-nix:/nix \
+       -v ~/$dir/claude:$CAPSULE_CONTAINER_HOME/.claude \
+       $CAPSULE_IMAGE"
+
+  local token_dir="${XDG_CONFIG_HOME:-$HOME/.config}/capsule/profiles/$profile"
+  mkdir -p "$token_dir"
+
+  local token
+  read -r -s -p "paste the token (input hidden), or press enter to skip: " token < /dev/tty
+  echo
+  [[ -n $token ]] || { echo "no token stored"; return 0; }
+
+  ( umask 077; printf '%s\n' "$token" > "$token_dir/token" )
+  echo "capsule: token stored for profile '$profile'"
+}
+
+cmd_image_pull() {
+  host_only image pull
   vm_reachable
   drop_nix_volume
-  # Pulling a moved :latest untags the old image; it lingers as <none> until pruned.
   ssh_vm "podman pull $CAPSULE_IMAGE && podman image prune -f"
 }
 
-cmd_image() {
-  host_only image
+cmd_image_build() {
+  host_only image build
   vm_reachable
   local src="$CAPSULE_SRC"
   [[ -d $src/container ]] || die "container/ not found under CAPSULE_SRC ($src)"
@@ -325,44 +815,82 @@ cmd_image() {
           && podman image prune -f"
 }
 
-cmd_gc() {
-  host_only gc
+cmd_vm_gc() {
+  host_only vm gc
   vm_reachable
   ssh_vm "podman container prune -f && podman image prune -f"
-  # No -d: it deletes the only generation of the default profile, taking cacert with it.
-  # Mount the cache: nix-direnv's gc roots point into it, and dangling roots eat every devshell.
   ssh_vm "podman run --rm -v capsule-nix:/nix -v ~/.capsule/cache:$CAPSULE_CONTAINER_HOME/.cache \
             --security-opt label=disable $CAPSULE_IMAGE -c 'nix-collect-garbage'"
+  sweep_branches
   ssh_vm "df -h /"
 }
 
-cmd_size() {
-  host_only size
+# Merges are squashes, so a branch's commits are not ancestors of main and every git-based
+# "is it merged" check answers no. The issue state is the only reliable signal, and
+# `archived` is kept: `issue reopen` resumes work there.
+sweep_branches() {
+  capsuled ping >/dev/null 2>&1 || return 0
+  git rev-parse --git-dir >/dev/null 2>&1 || return 0
+
+  local replica branches
+  replica=$(capsuled project.get "$(project_params)}" 2>/dev/null \
+            | jq -r '.replica // empty') || return 0
+  [[ -n $replica ]] || return 0
+
+  branches=$(capsuled gc.branches "$(project_params)}" 2>/dev/null | jq -r '.[]')
+  [[ -n $branches ]] || { echo "no merged branches to sweep"; return 0; }
+
+  local branch n=0
+  while read -r branch; do
+    [[ -n $branch ]] || continue
+    ssh_vm "git -C ~/capsule/$replica branch -D $branch" >/dev/null 2>&1 && n=$((n + 1))
+  done <<<"$branches"
+  echo "swept $n merged branch(es) from the replica"
+}
+
+cmd_vm_status() {
+  host_only vm status
+  local kind="remote"; vm_is_local && kind="local qemu"
+  printf 'host    %s:%s (%s)\n' "$CAPSULE_VM_HOST" "$CAPSULE_VM_PORT" "$kind"
+  if ! vm_running; then
+    printf 'state   unreachable\n'
+    return 0
+  fi
+  printf 'state   up\n'
+  printf 'uptime  %s\n' "$(ssh_vm 'uptime -p 2>/dev/null || uptime' || echo unknown)"
+}
+
+cmd_vm_disk() {
+  host_only vm disk
+  qemu_only vm disk
   local img="$CAPSULE_DATA/fcos.qcow2"
-  [[ -e $img ]] || die "no VM disk at $img — run 'capsule vm' first"
+  [[ -e $img ]] || die "no VM disk at $img — run 'capsule vm start' first"
   vm_running && echo "capsule: VM is running — sizes may lag slightly" >&2
-  # qcow2 is sparse: "disk size" is what the host allocates now, "virtual size" is the guest's 80G.
   qemu-img info -U "$img" | grep -E 'virtual size|disk size'
 }
 
-cmd_ssh() {
-  host_only ssh
+cmd_vm_ssh() {
+  host_only vm ssh
   vm_reachable
+  ssh_ready
   if [[ $# -eq 0 ]]; then
-    exec ssh -t -o StrictHostKeyChecking=accept-new -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST"
+    exec ssh -t "${ssh_opts[@]}" "$CAPSULE_VM_HOST"
   fi
-  exec ssh -o StrictHostKeyChecking=accept-new -p "$CAPSULE_VM_PORT" "$CAPSULE_VM_HOST" "$@"
+  exec ssh "${ssh_opts[@]}" "$CAPSULE_VM_HOST" "$@"
 }
 
-cmd_stop() {
-  host_only stop
+cmd_vm_stop() {
+  host_only vm stop
+  qemu_only vm stop
   vm_reachable
   ssh_vm "sudo poweroff" 2>/dev/null || true
+  ssh -O exit "${ssh_opts[@]}" "$CAPSULE_VM_HOST" 2>/dev/null || true
   echo "capsule: VM shutting down"
 }
 
-cmd_destroy() {
-  host_only destroy
+cmd_vm_destroy() {
+  host_only vm destroy
+  qemu_only vm destroy
   local img="$CAPSULE_DATA/fcos.qcow2"
   [[ -e $img ]] || die "no VM disk at $img"
   echo "this deletes the VM disk at $img"
@@ -373,21 +901,22 @@ cmd_destroy() {
   echo
   [[ $ans == [yY] ]] || { echo "aborted"; return 1; }
   rm -f "$img" "$CAPSULE_DATA/fcos.ign"
+  ssh -O exit "${ssh_opts[@]}" "$CAPSULE_VM_HOST" 2>/dev/null || true
   ssh-keygen -R "[${CAPSULE_VM_HOST##*@}]:${CAPSULE_VM_PORT}" >/dev/null 2>&1 || true
-  echo "capsule: destroyed — 'capsule vm' will fetch a fresh disk"
+  echo "capsule: destroyed — 'capsule vm start' will fetch a fresh disk"
 }
 
-cmd_vm() {
-  host_only vm
+cmd_vm_start() {
+  host_only vm start
+  qemu_only vm start
   [[ "$(uname -m)" == arm64 || "$(uname -m)" == aarch64 ]] \
-    || die "capsule vm only supports aarch64 hosts (found $(uname -m)); point CAPSULE_VM_HOST at a real machine instead"
+    || die "capsule vm start only supports aarch64 hosts (found $(uname -m)); point CAPSULE_VM_HOST at a real machine instead"
   [[ -r $CAPSULE_SSH_KEY ]] || die "no ssh public key at $CAPSULE_SSH_KEY (set CAPSULE_SSH_KEY)"
 
   mkdir -p "$CAPSULE_DATA"
   local img="$CAPSULE_DATA/fcos.qcow2"
 
   if [[ ! -e $img ]]; then
-    # A fresh disk means a fresh host key; drop the stale entry so ssh accepts the new one.
     ssh-keygen -R "[${CAPSULE_VM_HOST##*@}]:${CAPSULE_VM_PORT}" >/dev/null 2>&1 || true
     echo "capsule: no disk yet, fetching Fedora CoreOS ($CAPSULE_STREAM, aarch64)"
     local meta url want xz got
@@ -402,13 +931,11 @@ cmd_vm() {
     got=$(shasum -a 256 "$xz" | cut -d' ' -f1)
     [[ $got == "$want" ]] || die "checksum mismatch on $xz (expected $want, got $got)"
 
-    # Resize before the first boot: FCOS grows root to fill the disk on boot 1.
     unxz -c "$xz" > "$img"
     qemu-img resize "$img" "$CAPSULE_DISK_SIZE"
     rm -f "$xz"
   fi
 
-  # Regenerated every start: a stale ignition silently ignores every config change.
   local ign="$CAPSULE_DATA/fcos.ign"
   sed "s|@SSH_KEY@|$(<"$CAPSULE_SSH_KEY")|" "${CAPSULE_BUTANE:-$CAPSULE_SHARE/fcos.bu.tmpl}" \
     | butane --strict > "$ign"
@@ -430,65 +957,275 @@ cmd_vm() {
     -nic "user,hostfwd=tcp::${CAPSULE_VM_PORT}-:22"
 }
 
-# ---------------------------------------------------------------- dispatch
+if [[ -t 1 ]]; then _b=$'\e[1m'; _d=$'\e[36m'; _r=$'\e[0m'; else _b=''; _d=''; _r=''; fi
 
 usage() {
-  local b='' d='' r=''
-  if [[ -t 1 ]]; then b=$'\e[1m'; d=$'\e[36m'; r=$'\e[0m'; fi
   cat <<EOF
 
-${b}capsule${r} — run coding agents in a container, on a VM, on a git replica
+${_b}capsule${_r} — run coding agents in a container, on a VM, on a git replica
 
-${b}project${r}   (works on the host and inside the capsule)
-  ${d}init${r} [lang] [name]  scaffold flake.nix, .envrc, .gitignore, git repo
-  ${d}add${r} <pkg>...        add packages to flake.nix
-  ${d}rm${r} <pkg>...         remove packages from flake.nix
-  ${d}update${r}              nix flake update, then reload
-  ${d}reload${r}              direnv reload
+  ${_d}project${_r} which repositories capsule knows about
+  ${_d}env${_r}     devshell flake for this project — the only group that works inside a capsule
+  ${_d}vm${_r}      the machine the agent runs on
+  ${_d}image${_r}   the container image the agent runs in
+  ${_d}issue${_r}   the backlog for this project
+  ${_d}memory${_r}  what a fresh agent could not work out for itself
+  ${_d}run${_r}     hand work to an agent and take it back
+  ${_d}daemon${_r}  the host service everything else reads from
+  ${_d}board${_r}   the dashboard — read-only, no actions
 
-${b}capsule${r}   (host only)
-  ${d}shell${r} [profile]     start the agent container for \$PWD (default: default)
-  ${d}vm${r}                  boot the qemu VM, downloading the disk if needed
-  ${d}ssh${r} [cmd...]        ssh into the VM, or run one command there
-  ${d}size${r}                show the VM disk's actual vs virtual size
-  ${d}pull${r}                pull the published image, dropping the stale nix volume
-  ${d}image${r}               build the image locally instead
-  ${d}gc${r}                  prune containers/images, collect nix garbage
-  ${d}stop${r}                power off the VM (disk is kept)
-  ${d}destroy${r}             delete the VM disk (asks first)
-
-${b}handoff${r}   (host only)
-  ${d}push${r}                git push vm HEAD:$CAPSULE_BRANCH
-  ${d}fetch${r}               git fetch vm — refs only, nothing else changes
-  ${d}review${r}              show every commit and patch waiting in vm/$CAPSULE_BRANCH
-  ${d}merge${r}               diffstat, confirm, merge --no-ff, re-sync the replica
+'capsule <group>' lists that group's commands.
 
 EOF
 }
 
-# Dispatch only when executed, not when sourced — test/capsule-test.sh sources this file
-# to drive the package helpers directly.
-if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
-  case "${1:-}" in
-    init)   shift; cmd_init "$@" ;;
-    add)    shift; cmd_add "$@" ;;
-    rm)     shift; cmd_rm "$@" ;;
-    update) cmd_update ;;
-    reload) direnv reload ;;
-    shell)  shift; cmd_shell "$@" ;;
-    vm)     cmd_vm ;;
-    ssh)    shift; cmd_ssh "$@" ;;
-    size)   cmd_size ;;
-    pull)   cmd_pull ;;
-    image)  cmd_image ;;
-    gc)     cmd_gc ;;
-    stop)   cmd_stop ;;
-    destroy) cmd_destroy ;;
-    push)   cmd_push ;;
-    fetch)  cmd_fetch ;;
-    review) cmd_review ;;
-    merge)  cmd_merge ;;
-    ""|help|-h|--help) usage ;;
-    *)      echo "capsule: unknown command '$1'" >&2; usage >&2; exit 2 ;;
+usage_env() {
+  cat <<EOF
+
+${_b}capsule env${_r} — the project's Nix devshell
+
+  ${_d}init${_r} [lang] [name]  scaffold flake.nix, .envrc, .gitignore, git repo (host only)
+  ${_d}add${_r} <pkg>...        add packages to flake.nix
+  ${_d}rm${_r} <pkg>...         remove packages from flake.nix
+  ${_d}update${_r}              nix flake update, then reload
+  ${_d}reload${_r}              direnv reload
+
+Everything but 'init' works inside a capsule as well as on the host.
+
+EOF
+}
+
+usage_vm() {
+  cat <<EOF
+
+${_b}capsule vm${_r} — the machine the agent runs on
+
+  ${_d}status${_r}              where the agent host is, and whether it's up
+  ${_d}ssh${_r} [cmd...]        ssh into it, or run one command there
+  ${_d}gc${_r}                  prune containers/images, collect nix garbage
+
+Local qemu VM only — not available when CAPSULE_VM_HOST names a real machine:
+
+  ${_d}start${_r}               boot it, downloading the disk if needed
+  ${_d}stop${_r}                power it off (disk is kept)
+  ${_d}disk${_r}                actual vs virtual size of the VM disk
+  ${_d}destroy${_r}             delete the VM disk (asks first)
+
+EOF
+}
+
+usage_image() {
+  cat <<EOF
+
+${_b}capsule image${_r} — the container image the agent runs in
+
+  ${_d}pull${_r}                pull the published image, dropping the stale nix volume
+  ${_d}build${_r}               build it locally instead, from this checkout
+
+EOF
+}
+
+usage_issue() {
+  cat <<INNER
+
+${_b}capsule issue${_r} — the backlog for this project
+
+  ${_d}new${_r} <title>           create one; the body opens in \$EDITOR
+  ${_d}list${_r} [state]          every issue, or only those in one state
+  ${_d}edit${_r} [id]             edit the body in \$EDITOR
+  ${_d}rename${_r} [id] <title>   change the title (no editor: it is one line)
+  ${_d}comment${_r} [id]          add a note to the event log
+  ${_d}triage${_r}              review everything an agent filed, in one buffer
+  ${_d}archive${_r} [id] -m ...  set it aside, with a reason (reversible)
+  ${_d}reopen${_r} [id]          bring an archived issue back
+
+Omit the id and a picker opens. Ids resolve by unique prefix, as git resolves a
+short SHA, so the short form is enough.
+
+INNER
+}
+
+usage_project() {
+  cat <<EOF
+
+${_b}capsule project${_r} — which repositories capsule knows about
+
+  ${_d}add${_r} [--profile <name>]  register \$PWD (default profile: default)
+  ${_d}list${_r}                    every registered project
+  ${_d}profile${_r} <name>          change this project's profile
+  ${_d}rm${_r} [--force]            unregister; refuses while issues exist
+
+Registration is explicit and writes nothing into the repository — a project is a row
+in the host's store. A profile belongs to the project, not to a run.
+
+EOF
+}
+
+usage_daemon() {
+  cat <<EOF
+
+${_b}capsule daemon${_r} — the host service that owns the store and the world model
+
+  ${_d}start${_r}               start it, via the user service if one is installed
+  ${_d}stop${_r}                stop it
+  ${_d}status${_r}              whether it is up, and what it is holding
+
+EOF
+}
+
+usage_run() {
+  cat <<EOF
+
+${_b}capsule run${_r} — hand work to an agent and take it back
+
+  ${_d}start${_r} [issue-id]    dispatch an issue to an agent (a picker opens without one)
+  ${_d}attach${_r}              reconnect to the live run
+  ${_d}list${_r}                runs on this project, newest first
+  ${_d}push${_r} [issue-id]     push HEAD onto that issue's branch in the replica
+  ${_d}fetch${_r}               git fetch vm — refs only, nothing else changes
+  ${_d}review${_r} [issue-id]   review that issue's branch in tuicr (git log -p without it)
+  ${_d}merge${_r} [issue-id]    squash into this branch, mark the issue done, re-sync
+
+EOF
+}
+
+die_usage() {
+  local group="$1"; shift
+  echo "capsule: $*" >&2
+  "usage_$group" >&2
+  exit 2
+}
+
+dispatch_env() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    init)   cmd_env_init "$@" ;;
+    add)    cmd_env_add "$@" ;;
+    rm)     cmd_env_rm "$@" ;;
+    update) cmd_env_update ;;
+    reload) cmd_env_reload ;;
+    ""|help) usage_env ;;
+    *)      die_usage env "unknown command 'env $verb'" ;;
   esac
+}
+
+dispatch_vm() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    status)  cmd_vm_status ;;
+    start)   cmd_vm_start ;;
+    stop)    cmd_vm_stop ;;
+    ssh)     cmd_vm_ssh "$@" ;;
+    disk)    cmd_vm_disk ;;
+    gc)      cmd_vm_gc ;;
+    destroy) cmd_vm_destroy ;;
+    ""|help) usage_vm ;;
+    *)       die_usage vm "unknown command 'vm $verb'" ;;
+  esac
+}
+
+dispatch_image() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    pull)    cmd_image_pull ;;
+    build)   cmd_image_build ;;
+    ""|help) usage_image ;;
+    *)       die_usage image "unknown command 'image $verb'" ;;
+  esac
+}
+
+dispatch_memory() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    list)    cmd_memory_list ;;
+    review)  cmd_memory_review ;;
+    new)     cmd_memory_new ;;
+    ""|help) usage_memory ;;
+    *)       die_usage memory "unknown command 'memory $verb'" ;;
+  esac
+}
+
+usage_memory() {
+  cat <<INNER
+
+${_b}capsule memory${_r} — what a fresh agent could not work out for itself
+
+  ${_d}list${_r}                every memory and its state
+  ${_d}review${_r}              review proposals and prune the active set
+  ${_d}new${_r}                 write one by hand
+
+Memories are injected into every agent session for this project. The cap is 40 active
+and it is enforced: accepting at the cap requires deactivating one in the same pass.
+That refusal is the entire reason curation happens.
+
+INNER
+}
+
+dispatch_issue() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    new)     cmd_issue_new "$@" ;;
+    list)    cmd_issue_list "$@" ;;
+    edit)    cmd_issue_edit "$@" ;;
+    rename)  cmd_issue_rename "$@" ;;
+    comment) cmd_issue_comment "$@" ;;
+    triage)  cmd_issue_triage ;;
+    archive) cmd_issue_archive "$@" ;;
+    reopen)  cmd_issue_reopen "$@" ;;
+    ""|help) usage_issue ;;
+    *)       die_usage issue "unknown command 'issue $verb'" ;;
+  esac
+}
+
+dispatch_project() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    add)     cmd_project_add "$@" ;;
+    list)    cmd_project_list ;;
+    rm)      cmd_project_rm "$@" ;;
+    profile) cmd_project_profile "$@" ;;
+    ""|help) usage_project ;;
+    *)       die_usage project "unknown command 'project $verb'" ;;
+  esac
+}
+
+dispatch_daemon() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    start)   cmd_daemon_start ;;
+    stop)    cmd_daemon_stop ;;
+    status)  cmd_daemon_status ;;
+    ""|help) usage_daemon ;;
+    *)       die_usage daemon "unknown command 'daemon $verb'" ;;
+  esac
+}
+
+dispatch_run() {
+  local verb="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$verb" in
+    start)   cmd_run_start "$@" ;;
+    attach)  cmd_run_attach ;;
+    list)    cmd_run_list ;;
+    push)    cmd_run_push "$@" ;;
+    fetch)   cmd_run_fetch ;;
+    review)  cmd_run_review "$@" ;;
+    merge)   cmd_run_merge "$@" ;;
+    ""|help) usage_run ;;
+    *)       die_usage run "unknown command 'run $verb'" ;;
+  esac
+}
+
+main() {
+  local group="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$group" in
+    project|env|vm|image|run|issue|memory|daemon) "dispatch_$group" "$@" ;;
+    board) cmd_board ;;
+    login) cmd_login "$@" ;;
+    ""|help|-h|--help) usage ;;
+    *) echo "capsule: unknown command group '$group'" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+  main "$@"
 fi

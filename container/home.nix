@@ -18,9 +18,8 @@
   programs.direnv = {
     enable = true;
     nix-direnv.enable = true;
-    # direnv runs untrusted project code, but the VM — not this whitelist — is the
-    # security boundary, so there's no point locking it down. Projects are bind-mounted
-    # at the VM's own path, which differs per host user (/home vs /var/home on FCOS).
+    # The VM, not this whitelist, is the security boundary. Both prefixes because the
+    # VM's home path differs per host (/home vs /var/home on FCOS).
     config.whitelist.prefix = [ "/home" "/var/home" ];
     stdlib = ''
       declare -A direnv_layout_dirs
@@ -33,9 +32,15 @@
     '';
   };
 
+  # tmux is here rather than on the VM because the connection that breaks is host→VM, so
+  # the multiplexer has to be on the far side of it. The seeded scripts may depend on
+  # tmux, curl, jq and a POSIX shell only: this image re-locks weekly and the rest drifts.
   home.packages = with pkgs; [
     claude-code
     cursor-cli
+    tmux
+    curl
+    jq
     docker-client
     coreutils
     ripgrep
