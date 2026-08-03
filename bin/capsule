@@ -190,6 +190,29 @@ cmd_project_rm() {
   need_daemon
   local force=false
   [[ ${1:-} == --force ]] && force=true
+
+  # project.rm refuses while issues exist, but the remote clean has to run first — the
+  # store is what names the replica and the run directories. Asking the same question here
+  # keeps a refusal from arriving after the replica is already gone; the daemon still
+  # enforces it.
+  if [[ $force != true ]]; then
+    local issues
+    issues=$(capsuled issue.list "$(project_params)}" | jq -r 'length') || exit 1
+    [[ $issues == 0 ]] \
+      || die "this project still has $issues issue(s) — pass --force to remove it anyway"
+  fi
+
+  local replica
+  replica=$(capsuled project.get "$(project_params)}" | jq -r '.replica') || exit 1
+  # An unreachable VM costs only the remote half: refusing would strand a project that
+  # could then never be unregistered.
+  if vm_running; then
+    reset_vm_side "$replica" "$force"
+  else
+    echo "capsule: VM unreachable — replica $replica and its run dirs left in place" >&2
+  fi
+  reset_local_side
+
   capsuled project.rm "$(project_params),\"force\":$force}"
 }
 
@@ -686,6 +709,70 @@ ensure_replica() { # ensure_replica <replica-name> <branch>
     || die "the replica could not check out $branch — is its working tree dirty? 'capsule vm ssh' to look"
 }
 
+reset_vm_side() { # reset_vm_side <replica> <force>
+  local replica="$1" force="$2"
+
+  # A squash merge leaves the branch's commits out of main's ancestry, so git cannot answer
+  # "is this merged" — the issue states behind gc.branches are the only signal there is.
+  if [[ $force != true ]]; then
+    local on_replica merged unmerged
+    on_replica=$(ssh_vm "git -C ~/capsule/$replica for-each-ref --format='%(refname:short)' refs/heads/capsule/" 2>/dev/null || true)
+    if [[ -n $on_replica ]]; then
+      merged=$(capsuled gc.branches "$(project_params)}" | jq -r '.[]')
+      unmerged=$(comm -23 <(sort <<<"$on_replica") <(sort <<<"$merged"))
+      if [[ -n $unmerged ]]; then
+        echo "capsule: the replica still holds unmerged work:" >&2
+        sed 's/^/  /' <<<"$unmerged" >&2
+        die "'capsule run fetch' brings the branches here first; --force drops them"
+      fi
+    fi
+  fi
+
+  local runs containers dirs
+  runs=$(capsuled gc.runs "$(project_params)}") || exit 1
+  containers=$(jq -r '[.[].container] | join(" ")' <<<"$runs")
+  dirs=$(jq -r '.[] | "~/.capsule/runs/" + .dir' <<<"$runs" | tr '\n' ' ')
+
+  if [[ -n $containers ]]; then
+    ssh_vm "podman rm -f $containers" >/dev/null 2>&1 || true
+    ssh_vm "rm -rf $dirs"
+  fi
+  ssh_vm "rm -rf ~/capsule/$replica"
+  printf 'capsule: removed replica %s and %s run dir(s) from the VM\n' \
+    "$replica" "$(jq -r 'length' <<<"$runs")"
+}
+
+# Dropping the remote takes refs/remotes/vm/* with it, so the replica's branches leave no
+# trace here either.
+reset_local_side() {
+  if git remote get-url vm >/dev/null 2>&1; then
+    git remote remove vm
+    echo "capsule: removed the 'vm' remote and its tracking refs"
+  fi
+}
+
+cmd_run_reset() {
+  host_only run reset
+  need_daemon
+  local force=false
+  [[ ${1:-} == --force ]] && force=true
+
+  local project replica
+  project=$(capsuled project.get "$(project_params)}") \
+    || die "not a registered project — nothing to reset"
+  replica=$(jq -r '.replica' <<<"$project")
+
+  local live
+  live=$(capsuled run.list "$(project_params)}") || exit 1
+  [[ $(jq -r 'map(select(.state == "active")) | length' <<<"$live") == 0 ]] \
+    || die "a run is still live — 'capsule run end' first"
+
+  vm_reachable
+  reset_vm_side "$replica" "$force"
+  reset_local_side
+  echo "capsule: the project is still registered — 'capsule run start' rebuilds from scratch"
+}
+
 seed_to_vm() { # seed_to_vm <run-dir> <issue-short> <title> <project-dir> <run-token> <profile>
   local run_dir="$1" issue="$2" title="$3" proj="$4" run_token="$5" profile="$6"
   local local_seed oauth
@@ -1113,6 +1200,9 @@ ${_b}capsule project${_r} — which repositories capsule knows about
 Registration is explicit and writes nothing into the repository — a project is a row
 in the host's store. A profile belongs to the project, not to a run.
 
+${_d}rm${_r} also does what ${_d}capsule run reset${_r} does: the replica, the run directories and the
+'vm' remote go with the project. Agent logins are per profile and survive both.
+
 EOF
 }
 
@@ -1136,6 +1226,7 @@ ${_b}capsule run${_r} — hand work to an agent and take it back
   ${_d}start${_r} [issue-id]    dispatch an issue to an agent (a picker opens without one)
   ${_d}attach${_r}              reconnect to the live run
   ${_d}end${_r}                 end the live run and remove its container
+  ${_d}reset${_r} [--force]     drop this project's replica, run dirs and 'vm' remote
   ${_d}list${_r}                runs on this project, newest first
   ${_d}push${_r} [issue-id]     push HEAD onto that issue's branch in the replica
   ${_d}fetch${_r}               git fetch vm — refs only, nothing else changes
@@ -1263,6 +1354,7 @@ dispatch_run() {
     start)   cmd_run_start "$@" ;;
     attach)  cmd_run_attach ;;
     end)     cmd_run_end ;;
+    reset)   cmd_run_reset "$@" ;;
     list)    cmd_run_list ;;
     push)    cmd_run_push "$@" ;;
     fetch)   cmd_run_fetch ;;

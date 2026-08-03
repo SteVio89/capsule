@@ -1427,13 +1427,16 @@ pub const Daemon = struct {
         return protocol.writeErr(w, request.id, .unknown_method, request.method);
     }
 
-    /// Which replica branches `vm gc` may delete.
+    /// What the VM holds for a project that the host may reclaim: `branches` are the
+    /// replica branches `vm gc` may delete, `runs` every run directory and container
+    /// `run reset` must remove.
     fn dispatchGc(
         d: *Daemon,
         arena: std.mem.Allocator,
         w: *Io.Writer,
         request: protocol.Request,
     ) !void {
+        const verb = request.method["gc.".len..];
         const empty: std.json.ObjectMap = .empty;
         const params = switch (request.params) {
             .object => |o| o,
@@ -1444,13 +1447,32 @@ pub const Daemon = struct {
         const project_id = (try d.store.findProject(canonical)) orelse
             return protocol.writeErr(w, request.id, .no_project, canonical);
 
-        const done = try d.store.listIssues(arena, project_id, .done);
-        try w.print("{{\"id\":{d},\"ok\":true,\"result\":[", .{request.id});
-        for (done, 0..) |row, i| {
-            if (i > 0) try w.writeAll(",");
-            try w.print("\"capsule/{s}\"", .{ids.toHex(row.id)});
+        if (std.mem.eql(u8, verb, "branches")) {
+            const done = try d.store.listIssues(arena, project_id, .done);
+            try w.print("{{\"id\":{d},\"ok\":true,\"result\":[", .{request.id});
+            for (done, 0..) |row, i| {
+                if (i > 0) try w.writeAll(",");
+                try w.print("\"capsule/{s}\"", .{ids.toHex(row.id)});
+            }
+            return w.writeAll("]}\n");
         }
-        return w.writeAll("]}\n");
+
+        if (std.mem.eql(u8, verb, "runs")) {
+            // Every run, not a page of them: one missed row orphans a seed directory in
+            // the VM forever, and `run.list`'s display limit would do exactly that.
+            const rows = try d.store.listRuns(arena, project_id, std.math.maxInt(u32));
+            try w.print("{{\"id\":{d},\"ok\":true,\"result\":[", .{request.id});
+            for (rows, 0..) |row, i| {
+                if (i > 0) try w.writeAll(",");
+                try w.print("{{\"dir\":\"{s}\",\"container\":\"{s}\"}}", .{
+                    ids.toHex(row.id)[0..12],
+                    try store_mod.containerName(arena, row.id),
+                });
+            }
+            return w.writeAll("]}\n");
+        }
+
+        return protocol.writeErr(w, request.id, .unknown_method, request.method);
     }
 
     fn serveHttpRequest(d: *Daemon, stream: net.Stream) !void {
@@ -1604,7 +1626,7 @@ pub const Daemon = struct {
             return d.dispatchMemory(arena, w, request);
         }
 
-        if (std.mem.eql(u8, request.method, "gc.branches")) {
+        if (std.mem.startsWith(u8, request.method, "gc.")) {
             return d.dispatchGc(arena, w, request);
         }
 

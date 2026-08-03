@@ -82,7 +82,7 @@ for pair in \
   env:init env:add env:rm env:update env:reload \
   vm:status vm:start vm:stop vm:ssh vm:disk vm:gc vm:destroy \
   image:pull image:build \
-  run:start run:attach run:list run:push run:fetch run:review run:merge \
+  run:start run:attach run:end run:reset run:list run:push run:fetch run:review run:merge \
   project:add project:list project:rm project:profile \
   issue:new issue:list issue:edit issue:rename issue:comment \
   issue:triage issue:archive issue:reopen \
@@ -132,6 +132,33 @@ check "board refuses without a daemon rather than opening an empty screen" "caps
   "$(PATH="$work/stub:$PATH" bash "$cap" board 2>&1 | grep -o "capsule daemon start")"
 check "need_daemon names the remedy"       "capsule daemon start" \
   "$(PATH="$work/stub:$PATH" bash -c "set -e; . '$cap'; need_daemon" 2>&1 | grep -o "capsule daemon start")"
+
+env CAPSULE_IN_CAPSULE=1 bash "$cap" run reset >/dev/null 2>&1
+check "in-capsule: run reset refused"      "1" "$?"
+check "run reset needs the daemon"         "capsule daemon start" \
+  "$(PATH="$work/stub:$PATH" bash "$cap" run reset 2>&1 | grep -o "capsule daemon start")"
+
+# reset_vm_side with ssh_vm and capsuled stubbed: the replica carries two branches and the
+# store calls only one of them done, so the other must stop the wipe.
+reset_probe() { # reset_probe <force>
+  bash -c "
+    set -euo pipefail
+    . '$cap'
+    project_params() { printf '{'; }
+    ssh_vm() { case \"\$*\" in *for-each-ref*) printf 'capsule/aaa\ncapsule/bbb\n' ;; *) : ;; esac; }
+    capsuled() { case \"\$1\" in
+      gc.branches) echo '[\"capsule/aaa\"]' ;;
+      gc.runs)     echo '[]' ;;
+    esac; }
+    reset_vm_side myreplica $1
+  " 2>&1 || true
+}
+check "reset refuses on a branch whose issue is not done" "capsule/bbb" \
+  "$(reset_probe false | grep -o 'capsule/bbb' | head -1)"
+check "reset keeps a done branch out of the refusal"      "" \
+  "$(reset_probe false | grep -o 'capsule/aaa' | head -1)"
+check "--force wipes without asking about branches"       "removed replica myreplica" \
+  "$(reset_probe true | grep -o 'removed replica myreplica')"
 
 check "help never mentions a renamed-away verb" "" \
   "$({ capsule help; capsule env; capsule vm; capsule image; capsule run; } 2>&1 \

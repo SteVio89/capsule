@@ -238,6 +238,7 @@ a container where there is no socket to talk to.
 | `run start [issue]` | pick (or name) an issue, start the agent container for it |
 | `run attach` | reattach to the live run's tmux session |
 | `run end` | end the live run and remove its container |
+| `run reset [--force]` | remove this project from the VM entirely, and the `vm` remote with it |
 | `run list` | the project's runs and their states |
 | `run push [issue]` | `git push vm HEAD:capsule/<issue-id>` |
 | `run fetch` | `git fetch vm` — refs only |
@@ -250,6 +251,17 @@ stays `active` and refuses the next `run start`; `run end` clears it, and needs 
 that. The issue is left in `in_progress` either way, and `run start` offers it again — it
 resumes on the branch it already has. Use `issue state <id> open` when you are putting
 the work down rather than picking it back up, so the backlog reads honestly.
+
+`run reset` is the undo for everything `run start` built outside your working tree: the
+replica in the VM, every per-run seed directory, the containers, and the `vm` remote —
+which takes `refs/remotes/vm/*` with it. It refuses while the replica still holds a branch
+whose issue is not `done`, because a squash merge leaves those commits out of your history
+and the replica is the only copy; `run fetch` brings them here first, or `--force` drops
+them. The project stays registered with its issues and memories intact, so the next
+`run start` simply bootstraps a fresh replica. Agent logins live in the profile, not the
+project, and survive. Use it when a replica's tree is wedged, or to take a project off a
+shared VM without touching anyone else's — `vm destroy` is the blunt alternative and takes
+every project with it.
 
 `run review` opens the branch in [tuicr](https://tuicr.dev) — the whole diff as one
 PR-style buffer, with inline comments. Reviewing a revision range needs no GitHub
@@ -277,7 +289,7 @@ any other branch leave the replica untouched. Override which branch counts as
 | `project add [--profile <name>]` | register `$PWD`'s repository with capsule |
 | `project list` | every registered project |
 | `project profile <name>` | switch which profile this project's runs use |
-| `project rm [--force]` | retire it (`--force` also removes its issues and memories) |
+| `project rm [--force]` | retire it, and `run reset` with it (`--force` also removes its issues and memories) |
 
 **`capsule login [profile]`** — a container with a terminal to authenticate the agent
 CLI in; the stored token is injected into that profile's future runs (host only).
