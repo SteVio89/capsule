@@ -160,6 +160,26 @@ check "reset keeps a done branch out of the refusal"      "" \
 check "--force wipes without asking about branches"       "removed replica myreplica" \
   "$(reset_probe true | grep -o 'removed replica myreplica')"
 
+# A `capsuled container-cmd` line, verbatim. The remote login shell is the one parse it
+# gets, so `-lc` must still be followed by a single word: a second parse (an `eval`) splits
+# the tmux command into podman arguments, and bash -c then runs `tmux` with the rest as
+# positional parameters — an unnamed session, and no agent.
+container_line="'podman' 'run' '-d' '-t' '--name' 'capsule-x' '-w' '/proj' 'img' '-lc' \
+'tmux new-session -s capsule \"claude '\''Work on issue 018f2a1c.'\'' ; exec bash -l\"'"
+
+mkdir -p "$work/argv"
+printf '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n' > "$work/argv/podman"
+chmod +x "$work/argv/podman"
+remote_argv() { PATH="$work/argv:$PATH" sh -c "$container_line"; }
+
+check "the session command reaches podman as one argument" \
+  'tmux new-session -s capsule "claude '\''Work on issue 018f2a1c.'\'' ; exec bash -l"' \
+  "$(remote_argv | grep -A1 -x -- '-lc' | tail -1)"
+check "one parse leaves podman 10 arguments" "10" "$(remote_argv | wc -l | tr -d ' ')"
+
+check "no eval wraps a capsuled-built command line" "" \
+  "$(grep -n 'eval \$cmd' "$cap" | paste -sd, -)"
+
 check "help never mentions a renamed-away verb" "" \
   "$({ capsule help; capsule env; capsule vm; capsule image; capsule run; } 2>&1 \
      | grep -Eo '^  (shell|size)\b' | paste -sd, -)"

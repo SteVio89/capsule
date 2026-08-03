@@ -127,6 +127,10 @@ pub fn shellQuote(arena: std.mem.Allocator, word: []const u8) ![]const u8 {
 /// Joins an argv into a single shell-quoted command line, each word through
 /// `shellQuote` — the form that survives an ssh boundary intact. Allocated in `arena`,
 /// which owns it.
+///
+/// Quoted for exactly one shell parse, which the remote login shell performs. The caller
+/// must hand it to ssh as-is; an `eval` on the far side is a second parse that undoes the
+/// quoting and word-splits arguments that contain spaces.
 pub fn commandLine(arena: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (argv, 0..) |word, i| {

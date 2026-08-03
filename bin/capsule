@@ -841,7 +841,9 @@ cmd_run_start() {
           "$container" "$home/capsule/$replica" "$home/$run_dir/claude" \
           "$home/$run_dir/env" "$profile" "$issue_short")
 
-  ssh_vm "eval $cmd" >/dev/null || die "the container did not start"
+  # Never `eval` this: capsuled quotes it for one shell parse and the remote login shell is
+  # that parse. A second one strips the quotes and splits the tmux command into podman args.
+  ssh_vm "$cmd" >/dev/null || die "the container did not start"
   ssh_vm "rm -f ~/$run_dir/env"
 
   cmd_run_attach
@@ -859,7 +861,7 @@ cmd_run_attach() {
 
   ssh_ready
   local cmd; cmd=$(capsuled attach-cmd "$container")
-  ssh -t "${ssh_opts[@]}" "$CAPSULE_VM_HOST" "eval $cmd"
+  ssh -t "${ssh_opts[@]}" "$CAPSULE_VM_HOST" "$cmd"
 
   echo "capsule: detached — the agent is still running. 'capsule run attach' to return."
 }
