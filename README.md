@@ -1,5 +1,12 @@
 # capsule
 
+> [!IMPORTANT]
+> **This is a prototype, and it is 100% AI-generated.**
+>
+> I know that. It is deliberate. Right now I am proving out whether all my ideas
+> actually work and — most importantly — whether this supports the way I like to
+> work with AI agents. Polish and refactoring come *after* that, not before.
+
 Run coding agents in a container, on a VM, on a git replica.
 
 `capsule` gives an agent (Claude Code, Cursor CLI) a full Linux machine to work
