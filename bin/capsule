@@ -715,14 +715,14 @@ reset_vm_side() { # reset_vm_side <replica> <force>
   # A squash merge leaves the branch's commits out of main's ancestry, so git cannot answer
   # "is this merged" — the issue states behind gc.branches are the only signal there is.
   if [[ $force != true ]]; then
-    local on_replica merged unmerged
+    local on_replica merged unmerged indent=$'\n  '
     on_replica=$(ssh_vm "git -C ~/capsule/$replica for-each-ref --format='%(refname:short)' refs/heads/capsule/" 2>/dev/null || true)
     if [[ -n $on_replica ]]; then
       merged=$(capsuled gc.branches "$(project_params)}" | jq -r '.[]')
       unmerged=$(comm -23 <(sort <<<"$on_replica") <(sort <<<"$merged"))
       if [[ -n $unmerged ]]; then
         echo "capsule: the replica still holds unmerged work:" >&2
-        sed 's/^/  /' <<<"$unmerged" >&2
+        echo "  ${unmerged//$'\n'/$indent}" >&2
         die "'capsule run fetch' brings the branches here first; --force drops them"
       fi
     fi
