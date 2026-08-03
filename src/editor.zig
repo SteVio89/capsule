@@ -100,11 +100,17 @@ pub fn editText(
     }
 
     const editor = resolveEditor(environ);
+
+    const tty: ?Io.File = Io.Dir.cwd().openFile(io, "/dev/tty", .{ .mode = .read_write }) catch null;
+    defer if (tty) |t| t.close(io);
+    const child_stdio: std.process.SpawnOptions.StdIo =
+        if (tty) |t| .{ .file = t } else .inherit;
+
     var child = try std.process.spawn(io, .{
         .argv = &.{ "sh", "-c", try std.fmt.allocPrint(arena, "{s} \"$1\"", .{editor}), "sh", path },
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
+        .stdin = child_stdio,
+        .stdout = child_stdio,
+        .stderr = child_stdio,
     });
     const term = try child.wait(io);
     const exit_code: u8 = switch (term) {
