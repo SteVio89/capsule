@@ -148,6 +148,18 @@ test "the agent's reachable states, and only those" {
     }
 }
 
+test "a human moves an issue between the working states, and nowhere else" {
+    for ([_]State{ .open, .in_progress, .blocked, .ready_for_review }) |to| {
+        try testing.expectEqual(Outcome{ .moved = to }, apply(.in_progress, humanSets(to)));
+    }
+    for ([_]State{ .done, .archived, .proposed }) |to| {
+        try testing.expectEqual(
+            Outcome{ .illegal = .unreachable_from },
+            apply(.in_progress, humanSets(to)),
+        );
+    }
+}
+
 test "merge is the only path to done" {
     try testing.expectEqual(Outcome{ .moved = .done }, apply(.ready_for_review, human(.merged)));
     try testing.expectEqual(Outcome{ .moved = .done }, apply(.in_progress, human(.merged)));

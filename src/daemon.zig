@@ -528,6 +528,33 @@ pub const Daemon = struct {
             return d.writeIssue(w, request.id, fresh);
         }
 
+        if (std.mem.eql(u8, verb, "state")) {
+            const requested = stringParam(params, "state") orelse
+                return protocol.writeErr(w, request.id, .bad_params, "no state given");
+            const to = model_mod.Issue.State.parse(requested) orelse
+                return protocol.writeErr(w, request.id, .bad_params, "unknown state");
+
+            _ = d.store.appendEvent(
+                ids.generateNow(d.io),
+                row.id,
+                null,
+                .{ .kind = .state_changed, .actor = .human, .to = to },
+                "",
+                now,
+            ) catch |e| switch (e) {
+                error.IllegalTransition => return protocol.writeErr(
+                    w,
+                    request.id,
+                    .refused,
+                    "an issue does not move there by hand — 'run merge' reaches done, " ++
+                        "'issue archive' drops it, 'issue triage' accepts a proposal",
+                ),
+                else => return e,
+            };
+            const fresh = (try d.store.getIssue(arena, row.id)).?;
+            return d.writeIssue(w, request.id, fresh);
+        }
+
         if (std.mem.eql(u8, verb, "merge")) {
             _ = d.store.appendEvent(
                 ids.generateNow(d.io),

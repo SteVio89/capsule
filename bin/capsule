@@ -193,13 +193,16 @@ cmd_project_rm() {
   capsuled project.rm "$(project_params),\"force\":$force}"
 }
 
-pick_issue() { # pick_issue [state]
-  local filter="" listing params rows
+# The daemon's issue.list filters on one state, so a set is narrowed here instead.
+pick_issue() { # pick_issue [state[,state...]]
+  local listing params rows
   params=$(project_params)
-  [[ -n ${1:-} ]] && filter=",\"state\":$(json_string "$1")"
-  listing=$(capsuled issue.list "$params$filter}") || exit 1
+  listing=$(capsuled issue.list "$params}") || exit 1
 
-  rows=$(jq -r '.[] | [.short, .state, .title] | @tsv' <<<"$listing")
+  rows=$(jq -r --arg want "${1:-}" '
+    ($want | split(",") | map(select(length > 0))) as $states
+    | .[] | select($states == [] or (.state as $s | $states | index($s)))
+    | [.short, .state, .title] | @tsv' <<<"$listing")
   [[ -n $rows ]] || die "no issues here yet — 'capsule issue new <title>'"
 
   printf '%s\n' "$rows" \
@@ -323,6 +326,32 @@ cmd_issue_reopen() {
   local id; id=$(issue_id_or_pick "${1:-}" archived) || exit 1
   capsuled issue.reopen "$(project_params),\"id\":$(json_string "$id")}"
   echo "work resumes on the branch it already has"
+}
+
+# Only to tell 'issue state open' from 'issue state <id>'. What a human may actually set
+# is replay.zig's call, and the daemon makes it — nothing is rejected here.
+looks_like_state() {
+  case "$1" in
+    open | in_progress | blocked | ready_for_review) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_issue_state() {
+  host_only issue state
+  need_daemon
+
+  local id="" state=""
+  case $# in
+    1) looks_like_state "$1" || die "usage: capsule issue state [id] <state>"; state="$1" ;;
+    2) id="$1"; state="$2" ;;
+    *) die "usage: capsule issue state [id] <state>" ;;
+  esac
+
+  id=$(issue_id_or_pick "$id") || exit 1
+  [[ -n $id ]] || { echo "nothing selected"; return 1; }
+  capsuled issue.state \
+    "$(project_params),\"id\":$(json_string "$id"),\"state\":$(json_string "$state")}"
 }
 
 offer_memory_review() {
@@ -695,7 +724,9 @@ cmd_run_start() {
 
   vm_reachable
 
-  local issue; issue=$(issue_id_or_pick "$issue_arg" open) || exit 1
+  # in_progress and blocked are offered too: a run that died leaves its issue in one of
+  # them, and re-dispatching is how it resumes.
+  local issue; issue=$(issue_id_or_pick "$issue_arg" open,in_progress,blocked) || exit 1
   [[ -n $issue ]] || { echo "nothing selected"; return 1; }
 
   local started
@@ -744,6 +775,29 @@ cmd_run_attach() {
   ssh -t "${ssh_opts[@]}" "$CAPSULE_VM_HOST" "eval $cmd"
 
   echo "capsule: detached — the agent is still running. 'capsule run attach' to return."
+}
+
+cmd_run_end() {
+  host_only run end
+  need_daemon
+
+  local live container
+  live=$(capsuled run.list "$(project_params)}") || exit 1
+  container=$(jq -r 'map(select(.state == "active")) | first | .container // empty' <<<"$live")
+  [[ -n $container ]] || die "no run is live on this project"
+
+  capsuled run.end "$(project_params)}" >/dev/null || exit 1
+
+  # The store is the record and it is already updated; the container is tidied only if the
+  # VM answers. A run gets stuck precisely when the VM is unreachable, so needing it here
+  # would break the command in the one case it exists for.
+  if vm_running; then
+    ssh_vm "podman rm -f $container" >/dev/null 2>&1 || true
+  else
+    echo "capsule: VM unreachable — container $container left as it is"
+  fi
+
+  echo "capsule: run ended. The issue keeps its state — 'capsule issue state <id> open' to reset it."
 }
 
 cmd_run_list() {
@@ -1035,6 +1089,7 @@ ${_b}capsule issue${_r} — the backlog for this project
   ${_d}edit${_r} [id]             edit the body in \$EDITOR
   ${_d}rename${_r} [id] <title>   change the title (no editor: it is one line)
   ${_d}comment${_r} [id]          add a note to the event log
+  ${_d}state${_r} [id] <state>    set it by hand: open, in_progress, blocked, ready_for_review
   ${_d}triage${_r}              review everything an agent filed, in one buffer
   ${_d}archive${_r} [id] -m ...  set it aside, with a reason (reversible)
   ${_d}reopen${_r} [id]          bring an archived issue back
@@ -1080,6 +1135,7 @@ ${_b}capsule run${_r} — hand work to an agent and take it back
 
   ${_d}start${_r} [issue-id]    dispatch an issue to an agent (a picker opens without one)
   ${_d}attach${_r}              reconnect to the live run
+  ${_d}end${_r}                 end the live run and remove its container
   ${_d}list${_r}                runs on this project, newest first
   ${_d}push${_r} [issue-id]     push HEAD onto that issue's branch in the replica
   ${_d}fetch${_r}               git fetch vm — refs only, nothing else changes
@@ -1169,6 +1225,7 @@ dispatch_issue() {
     edit)    cmd_issue_edit "$@" ;;
     rename)  cmd_issue_rename "$@" ;;
     comment) cmd_issue_comment "$@" ;;
+    state)   cmd_issue_state "$@" ;;
     triage)  cmd_issue_triage ;;
     archive) cmd_issue_archive "$@" ;;
     reopen)  cmd_issue_reopen "$@" ;;
@@ -1205,6 +1262,7 @@ dispatch_run() {
   case "$verb" in
     start)   cmd_run_start "$@" ;;
     attach)  cmd_run_attach ;;
+    end)     cmd_run_end ;;
     list)    cmd_run_list ;;
     push)    cmd_run_push "$@" ;;
     fetch)   cmd_run_fetch ;;

@@ -154,6 +154,7 @@ a real machine they refuse — that box is not capsule's to boot or erase.
 | `issue edit [id]` | edit the body in `$EDITOR` |
 | `issue rename [id] <title>` | change the title |
 | `issue comment [id]` | add a note to the event log |
+| `issue state [id] <state>` | set it by hand: `open`, `in_progress`, `blocked`, `ready_for_review` |
 | `issue triage` | review everything an agent filed, in one buffer |
 | `issue archive [id] -m <reason>` | set it aside, with a reason (reversible) |
 | `issue reopen [id]` | bring an archived issue back onto its existing branch |
@@ -229,11 +230,19 @@ a container where there is no socket to talk to.
 |---|---|
 | `run start [issue]` | pick (or name) an issue, start the agent container for it |
 | `run attach` | reattach to the live run's tmux session |
+| `run end` | end the live run and remove its container |
 | `run list` | the project's runs and their states |
 | `run push [issue]` | `git push vm HEAD:capsule/<issue-id>` |
 | `run fetch` | `git fetch vm` — refs only |
 | `run review [issue]` | review the issue's branch in [tuicr](https://tuicr.dev), PR-style |
 | `run merge [issue]` | diffstat, confirm, **squash-merge** as one commit, mark the issue done |
+
+When a run dies with its container, the daemon sees the container gone and marks the run
+`abandoned` on its next poll — but only while the VM answers. If it does not, the run
+stays `active` and refuses the next `run start`; `run end` clears it, and needs no VM for
+that. The issue is left in `in_progress` either way, and `run start` offers it again — it
+resumes on the branch it already has. Use `issue state <id> open` when you are putting
+the work down rather than picking it back up, so the backlog reads honestly.
 
 `run review` opens the branch in [tuicr](https://tuicr.dev) — the whole diff as one
 PR-style buffer, with inline comments. Reviewing a revision range needs no GitHub
