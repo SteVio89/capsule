@@ -45,6 +45,9 @@ pub fn podmanArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
         "-e", "CAPSULE_IN_CAPSULE=1",
         "-e", try std.fmt.allocPrint(arena, "CAPSULE_PROFILE={s}", .{cfg.profile}),
         "-e", try std.fmt.allocPrint(arena, "CLAUDE_CONFIG_DIR={s}/.claude", .{cfg.container_home}),
+        // The container runs as root and the seeded settings ask for bypassPermissions,
+        // which claude refuses under uid 0 unless it is told it is already sandboxed.
+        "-e", "IS_SANDBOX=1",
         "-e", "DOCKER_HOST=unix:///run/podman.sock",
         "-e", "TESTCONTAINERS_RYUK_DISABLED=true",
         "-e", "TESTCONTAINERS_HOST_OVERRIDE=host.containers.internal",
@@ -66,14 +69,18 @@ pub fn podmanArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
 /// host. The connection that breaks is host→VM, so the multiplexer has to be on the far
 /// side of it; a tmux session on the user's own machine would keep their window layout
 /// and do nothing for a dropped ssh connection.
+///
+/// `direnv exec` rather than a bare `claude`: tmux runs this string through `sh -c`, and
+/// direnv's hook lives in bash's PROMPT_COMMAND, so it would not fire until the trailing
+/// `exec bash -l` — long after the agent had started without the project's devshell.
 pub fn sessionCommand(arena: std.mem.Allocator, cfg: Config) ![]const u8 {
     if (cfg.issue_short.len == 0) {
         return arena.dupe(u8, "tmux new-session -s capsule");
     }
 
     return std.fmt.allocPrint(arena,
-        \\tmux new-session -s capsule "claude 'Work on issue {s}. Call get_issue first for the description and the project memory, then set_state in_progress.' ; exec bash -l"
-    , .{cfg.issue_short});
+        \\tmux new-session -s capsule "direnv exec '{s}' claude 'Work on issue {s}. Call get_issue first for the description and the project memory, then set_state in_progress.' ; exec bash -l"
+    , .{ cfg.project_dir, cfg.issue_short });
 }
 
 /// `capsule run attach` — ssh, into the container, into tmux.
@@ -197,6 +204,24 @@ test "the per-run agent state is mounted, not the profile's" {
     defer a.deinit();
     const line = try joined(a.allocator(), try podmanArgs(a.allocator(), example));
     try testing.expect(std.mem.indexOf(u8, line, "runs/019fb1ce/claude:/home/agent/.claude") != null);
+}
+
+test "claude is told it is sandboxed, or bypassPermissions refuses to run as root" {
+    var a = testArena();
+    defer a.deinit();
+    const line = try joined(a.allocator(), try podmanArgs(a.allocator(), example));
+    try testing.expect(std.mem.indexOf(u8, line, "IS_SANDBOX=1") != null);
+}
+
+test "the agent starts inside the project's direnv environment" {
+    var a = testArena();
+    defer a.deinit();
+    const command = try sessionCommand(a.allocator(), example);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        command,
+        "direnv exec '/var/home/core/capsule/api-f23e31bc' claude ",
+    ) != null);
 }
 
 test "the session runs the agent under tmux and falls through to a shell" {
