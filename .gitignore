@@ -1,11 +1,5 @@
 .direnv/
 result
-<<<<<<< HEAD
-zig-out/
-zig-pkg/
-.zig-cache/
-=======
 .zig-cache/
 zig-out/
 zig-pkg/
->>>>>>> vm/capsule

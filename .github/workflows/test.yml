@@ -20,6 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v22
+      # zig 0.16 writes a zip dependency into $ZIG_GLOBAL_CACHE_DIR/tmp without
+      # creating that directory first, so on a cold runner the sqlite amalgamation
+      # fetch dies with "failed to create temporary zip file: FileNotFound".
+      - run: mkdir -p ~/.cache/zig/tmp
       - run: nix develop --command zig fmt --check src build.zig
       - run: nix develop --command zig build test
       - run: nix develop --command sh -c 'zig build && bash test/capsuled-test.sh'

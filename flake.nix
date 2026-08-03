@@ -24,6 +24,8 @@
             dontInstall = true;
             buildPhase = ''
               export HOME=$TMPDIR ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
+              # zig 0.16 does not create tmp/ before writing a zip dependency there.
+              mkdir -p $ZIG_GLOBAL_CACHE_DIR/tmp
               ${pkgs.lib.getExe pkgs.zig_0_16} build --fetch=all
               mv zig-pkg $out
             '';
