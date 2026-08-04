@@ -852,12 +852,15 @@ cmd_run_start() {
   seed_to_vm "$run_dir" "$issue_short" "$title" "$home/capsule/$replica" "$token" "$profile"
   seed_git_identity
 
+  local git_cfg=""
+  if ssh_vm "test -f ~/.gitconfig"; then git_cfg="$home/.gitconfig"; fi
+
   printf '\n  capsule  %s  %s\n  %s\n\n' "$issue_short" "$title" "$branch"
 
   local cmd
   cmd=$(CAPSULE_IMAGE="$CAPSULE_IMAGE" capsuled container-cmd \
           "$container" "$home/capsule/$replica" "$home/$run_dir/claude" \
-          "$home/$run_dir/env" "$profile" "$issue_short")
+          "$home/$run_dir/env" "$profile" "$issue_short" "$git_cfg")
 
   # Never `eval` this: capsuled quotes it for one shell parse and the remote login shell is
   # that parse. A second one strips the quotes and splits the tmux command into podman args.

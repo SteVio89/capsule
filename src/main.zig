@@ -179,6 +179,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .env_file = args.next() orelse "",
                 .profile = args.next() orelse "default",
                 .issue_short = args.next() orelse "",
+                .git_config_path = args.next() orelse "",
             });
 
         try out.interface.print("{s}\n", .{try capsuled.run.commandLine(arena, argv)});

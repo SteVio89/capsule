@@ -17,6 +17,10 @@ pub const Config = struct {
     profile: []const u8,
     /// Empty for `capsule login`, which has no issue and no token.
     issue_short: []const u8 = "",
+    /// The VM's `~/.gitconfig`, mounted read-only into the container. Empty when the VM
+    /// has none — the caller checks first, since mounting a missing path makes podman
+    /// create an empty directory there instead.
+    git_config_path: []const u8 = "",
 };
 
 /// The detached `podman run` for an agent session.
@@ -57,7 +61,16 @@ pub fn podmanArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
         "-v",      "capsule-nix:/nix",
         "-v",      try std.fmt.allocPrint(arena, "{s}:{s}/.claude", .{ cfg.agent_state_dir, cfg.container_home }),
         "-v",      try std.fmt.allocPrint(arena, "{s}:{s}", .{ cfg.project_dir, cfg.project_dir }),
-        "-w",      cfg.project_dir,
+    });
+
+    if (cfg.git_config_path.len > 0) {
+        try args.appendSlice(arena, &.{
+            "-v", try std.fmt.allocPrint(arena, "{s}:{s}/.gitconfig:ro", .{ cfg.git_config_path, cfg.container_home }),
+        });
+    }
+
+    try args.appendSlice(arena, &.{
+        "-w", cfg.project_dir,
         cfg.image,
     });
 
@@ -217,6 +230,22 @@ test "the per-run agent state is mounted, not the profile's" {
     defer a.deinit();
     const line = try joined(a.allocator(), try podmanArgs(a.allocator(), example));
     try testing.expect(std.mem.indexOf(u8, line, "runs/019fb1ce/claude:/home/agent/.claude") != null);
+}
+
+test "the host's git identity is mounted read-only when the VM has one" {
+    var a = testArena();
+    defer a.deinit();
+    var with_git = example;
+    with_git.git_config_path = "/home/core/.gitconfig";
+    const line = try joined(a.allocator(), try podmanArgs(a.allocator(), with_git));
+    try testing.expect(std.mem.indexOf(u8, line, "/home/core/.gitconfig:/home/agent/.gitconfig:ro") != null);
+}
+
+test "no gitconfig mount appears when the VM has none" {
+    var a = testArena();
+    defer a.deinit();
+    const line = try joined(a.allocator(), try podmanArgs(a.allocator(), example));
+    try testing.expect(std.mem.indexOf(u8, line, ".gitconfig") == null);
 }
 
 test "claude is told it is sandboxed, or bypassPermissions refuses to run as root" {
