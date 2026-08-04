@@ -72,14 +72,17 @@ pub fn podmanArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
 ///
 /// `direnv exec` rather than a bare `claude`: tmux runs this string through `sh -c`, and
 /// direnv's hook lives in bash's PROMPT_COMMAND, so it would not fire until the trailing
-/// `exec bash -l` — long after the agent had started without the project's devshell.
+/// `bash -l` — long after the agent had started without the project's devshell.
+///
+/// That shell loops instead of a one-shot `exec`: it is the only thing keeping the
+/// container alive, and `exit` typed out of habit before committing should not tear it down.
 pub fn sessionCommand(arena: std.mem.Allocator, cfg: Config) ![]const u8 {
     if (cfg.issue_short.len == 0) {
         return arena.dupe(u8, "tmux new-session -s capsule");
     }
 
     return std.fmt.allocPrint(arena,
-        \\tmux new-session -s capsule "direnv exec '{s}' claude 'Work on issue {s}. Call get_issue first for the description and the project memory, then set_state in_progress.' ; exec bash -l"
+        \\tmux new-session -s capsule "direnv exec '{s}' claude 'Work on issue {s}. Call get_issue first for the description and the project memory, then set_state in_progress.' ; while :; do bash -l; done"
     , .{ cfg.project_dir, cfg.issue_short });
 }
 
@@ -232,7 +235,16 @@ test "the session runs the agent under tmux and falls through to a shell" {
     try testing.expect(std.mem.indexOf(u8, command, "tmux new-session") != null);
     try testing.expect(std.mem.indexOf(u8, command, "018f2a1c") != null);
     try testing.expect(std.mem.indexOf(u8, command, "get_issue") != null);
-    try testing.expect(std.mem.indexOf(u8, command, "exec bash -l") != null);
+    try testing.expect(std.mem.indexOf(u8, command, "bash -l") != null);
+}
+
+test "the fallback shell respawns instead of exiting, so exit cannot kill the container" {
+    var a = testArena();
+    defer a.deinit();
+    const command = try sessionCommand(a.allocator(), example);
+
+    try testing.expect(std.mem.indexOf(u8, command, "while :; do bash -l; done") != null);
+    try testing.expect(std.mem.indexOf(u8, command, "exec bash -l") == null);
 }
 
 test "a login session has no issue and starts no agent" {
