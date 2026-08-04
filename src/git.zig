@@ -187,9 +187,23 @@ test "without a directory there is no -C at all" {
     try testing.expectEqualStrings("status", line[1]);
 }
 
+/// A `Git` for tests that need a real repository, or `SkipZigTest` when there is none.
+///
+/// The Nix build sandbox is exactly that case: the source arrives as an unpacked store
+/// path with no `.git`, and the check phase has no `git` binary. These tests assert on the
+/// repository capsule itself lives in — meaningful in a checkout, meaningless there — so
+/// they stand down rather than failing someone's `darwin-rebuild`.
+fn requireRepo(arena: std.mem.Allocator) !Git {
+    const git = Git{ .arena = arena, .io = testing.io };
+    const out = git.run(&.{ "rev-parse", "--git-dir" }) catch return error.SkipZigTest;
+    if (!out.ok()) return error.SkipZigTest;
+    return git;
+}
+
 test "discover resolves the repository capsule itself lives in" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
+    _ = try requireRepo(arena.allocator());
 
     const repo = try discover(arena.allocator(), testing.io);
     try testing.expect(std.fs.path.isAbsolute(repo.cwd));
@@ -204,8 +218,17 @@ test "realpath resolves a symlinked path to one spelling" {
 
     // Two spellings of the same directory must not produce two canonical paths, which is
     // the property the daemon's UNIQUE constraint on canonical_path depends on.
-    const direct = try realpath(a, testing.io, ".");
-    const indirect = try realpath(a, testing.io, "./src/..");
+    //
+    // The second spelling walks through a directory this test makes, rather than through
+    // `src/`: a test that assumes the repository's own layout fails anywhere the source is
+    // unpacked differently, which is a fact about the checkout and not about `realpath`.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try Io.Dir.cwd().createDirPath(testing.io, try std.fmt.allocPrint(a, "{s}/down", .{base}));
+
+    const direct = try realpath(a, testing.io, base);
+    const indirect = try realpath(a, testing.io, try std.fmt.allocPrint(a, "{s}/down/..", .{base}));
     try testing.expectEqualStrings(direct, indirect);
 }
 
@@ -214,7 +237,7 @@ test "a failing git command is a value, not a process death" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const git = Git{ .arena = a, .io = testing.io };
+    const git = try requireRepo(a);
     const out = try git.run(&.{ "rev-parse", "--verify", "refs/heads/definitely-not-a-branch" });
     try testing.expect(!out.ok());
     try testing.expect(!git.succeeds(&.{ "rev-parse", "--verify", "refs/heads/nope" }));
@@ -231,9 +254,12 @@ test "an argument carrying shell punctuation survives the round trip to git" {
 
     // Read-only, so it needs no scratch repository: git echoes the argument back through
     // a format expansion, proving it arrived as exactly one argument.
-    const git = Git{ .arena = a, .io = testing.io };
+    const git = try requireRepo(a);
     const nasty = "a message; with $(punctuation) and 'quotes'";
-    const got = try git.capture(&.{ "log", "-1", "--format=%s", "--no-walk", "HEAD" });
+
+    // A repository with no commits yet has nothing to log, which is not what is under test.
+    const got = git.capture(&.{ "log", "-1", "--format=%s", "--no-walk", "HEAD" }) catch
+        return error.SkipZigTest;
     try testing.expect(got.len > 0);
 
     const echoed = try git.capture(&.{ "rev-parse", "--sq-quote", nasty });
