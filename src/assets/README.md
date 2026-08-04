@@ -20,6 +20,7 @@ Code read `.claude.json` from this directory instead of the home root the mount 
 touches.
 | `~/.claude/hooks/*.sh` | this directory | **yes — see below** |
 | `~/.claude/statusline.sh` | this directory | **yes** |
+| `~/.claude/handoff.sh` | this directory | **yes — see below** |
 | `~/.claude/INSTRUCTIONS.md` | generated per run | no |
 
 ## The fill-in scripts
@@ -41,6 +42,32 @@ it is written for you.
 
 `hooks/quality-gate.sh` needs no filling in: it runs `just build` and `just test` when
 they exist and no-ops when they do not.
+
+`hooks/commit-gate.sh` needs none either: it refuses to let a turn end while the working
+tree is dirty, and says so in terms the agent can act on.
+
+## Leaving the container
+
+`handoff.sh` is not a hook. It is the last command in the container's tmux session, so
+quitting the agent runs it and then stops the container — there is nothing left holding
+the container up. Detaching from tmux and losing the ssh connection do not reach it; only
+quitting claude does.
+
+Two things commit, for two different reasons:
+
+| | when | message written by | covers |
+| --- | --- | --- | --- |
+| `hooks/commit-gate.sh` | end of every turn | the agent | the normal path |
+| `handoff.sh` | once, on the way out | nobody — it is flat | crashes, interrupted turns |
+
+The split is the whole design. An instruction only runs while there is an agent to follow
+it, and the trees that end up uncommitted are precisely the ones where the agent is gone.
+So the gate uses the agent while it is alive and can say what it did, and the handoff is
+the floor under it — normally finding a clean tree and doing nothing.
+
+`handoff.sh` writes what it did to `~/.claude/handoff.log` as well as the terminal: the
+tmux session ends the moment it returns, taking the terminal with it, and the host reads
+that file back after the session closes.
 
 ## The contract, if you are changing the plumbing
 

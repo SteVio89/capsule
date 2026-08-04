@@ -882,9 +882,36 @@ cmd_run_attach() {
 
   ssh_ready
   local cmd; cmd=$(capsuled attach-cmd "$container")
-  ssh -t "${ssh_opts[@]}" "$CAPSULE_VM_HOST" "$cmd"
+  # Under 'set -e' the exit status of a session that ended rather than detached would take
+  # the script with it, before it could say what happened to the work.
+  ssh -t "${ssh_opts[@]}" "$CAPSULE_VM_HOST" "$cmd" || true
 
-  echo "capsule: detached — the agent is still running. 'capsule run attach' to return."
+  if ssh_vm "podman container exists $container" 2>/dev/null; then
+    echo "capsule: detached — the agent is still running. 'capsule run attach' to return."
+    return 0
+  fi
+  report_session_end "$container"
+}
+
+# The container stops itself once the agent exits, and handoff.sh commits whatever was
+# left on the way out. Its report is on a terminal that no longer exists by the time ssh
+# returns, so it is read back from the run's state directory instead.
+report_session_end() { # report_session_end <container>
+  local container="$1" log
+  # Both names are cut from the same 12 hex characters of the run id — `capsule-<12>` in
+  # store.zig, `runs/<12>` in cmd_run_start — so one recovers the other.
+  local run_dir=".capsule/runs/${container#capsule-}"
+
+  # The daemon's poller marks a vanished container's run `abandoned` within seconds, and
+  # quitting the agent is a clean end, not something breaking. Whichever call lands first
+  # wins; both revoke the token, so losing the race costs only the wrong word in the list.
+  capsuled run.end "$(project_params)}" >/dev/null 2>&1 || true
+
+  log=$(ssh_vm "cat ~/$run_dir/claude/handoff.log 2>/dev/null" 2>/dev/null || true)
+  [[ -n $log ]] && printf '%s\n' "$log"
+
+  echo "capsule: the session ended and the container stopped."
+  echo "         'capsule run merge' to bring the work over, 'capsule run start' to resume."
 }
 
 cmd_run_end() {

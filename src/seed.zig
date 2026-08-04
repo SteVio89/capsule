@@ -5,7 +5,9 @@ const Io = std.Io;
 
 pub const comment_guard = @embedFile("assets/hooks/comment-guard.sh");
 pub const quality_gate = @embedFile("assets/hooks/quality-gate.sh");
+pub const commit_gate = @embedFile("assets/hooks/commit-gate.sh");
 pub const statusline = @embedFile("assets/statusline.sh");
+pub const handoff = @embedFile("assets/handoff.sh");
 
 pub const Run = struct {
     issue_short: []const u8,
@@ -83,7 +85,9 @@ pub fn instructions(arena: std.mem.Allocator, run: Run) ![]const u8 {
         \\survive it.
         \\
         \\Commit as you go. The branch is yours and nothing leaves this machine until a
-        \\human merges it.
+        \\human merges it, and a turn cannot end with changes still in the working tree —
+        \\you will be asked for the commit before you are let go. Write those messages
+        \\yourself: what changed, and why when the diff does not say it.
         \\
     , .{ run.issue_short, run.issue_title });
 }
@@ -160,19 +164,30 @@ fn hookConfig(arena: std.mem.Allocator) !std.json.ObjectMap {
     try hooks.put(arena, "PostToolUse", try matcherArray(
         arena,
         "Write|Edit|MultiEdit",
-        "~/.claude/hooks/comment-guard.sh",
+        &.{"~/.claude/hooks/comment-guard.sh"},
     ));
-    try hooks.put(arena, "Stop", try matcherArray(arena, "", "~/.claude/hooks/quality-gate.sh"));
+
+    // Order is the point: the gate that can still be fixed runs first, and the commit
+    // records a tree that has just been built and tested rather than one on its way there.
+    try hooks.put(arena, "Stop", try matcherArray(arena, "", &.{
+        "~/.claude/hooks/quality-gate.sh",
+        "~/.claude/hooks/commit-gate.sh",
+    }));
     return hooks;
 }
 
-fn matcherArray(arena: std.mem.Allocator, matcher: []const u8, command: []const u8) !std.json.Value {
-    var hook: std.json.ObjectMap = .empty;
-    try hook.put(arena, "type", .{ .string = "command" });
-    try hook.put(arena, "command", .{ .string = command });
-
+fn matcherArray(
+    arena: std.mem.Allocator,
+    matcher: []const u8,
+    commands: []const []const u8,
+) !std.json.Value {
     var inner = std.json.Array.init(arena);
-    try inner.append(.{ .object = hook });
+    for (commands) |command| {
+        var hook: std.json.ObjectMap = .empty;
+        try hook.put(arena, "type", .{ .string = "command" });
+        try hook.put(arena, "command", .{ .string = command });
+        try inner.append(.{ .object = hook });
+    }
 
     var entry: std.json.ObjectMap = .empty;
     if (matcher.len > 0) try entry.put(arena, "matcher", .{ .string = matcher });
@@ -200,8 +215,10 @@ pub fn writeTree(
     try writeFile(arena, io, dir, "settings.json", try mergeSettings(arena, user_template), false);
     try writeFile(arena, io, dir, "INSTRUCTIONS.md", try instructions(arena, run), false);
     try writeFile(arena, io, dir, "statusline.sh", statusline, true);
+    try writeFile(arena, io, dir, "handoff.sh", handoff, true);
     try writeFile(arena, io, dir, "hooks/comment-guard.sh", comment_guard, true);
     try writeFile(arena, io, dir, "hooks/quality-gate.sh", quality_gate, true);
+    try writeFile(arena, io, dir, "hooks/commit-gate.sh", commit_gate, true);
 }
 
 fn writeFile(
@@ -346,6 +363,25 @@ test "both hooks are configured, and MultiEdit is in the matcher" {
     try testing.expect(hooks.get("Stop") != null);
 }
 
+test "Stop verifies before it commits, so a failing build is not what gets recorded" {
+    var a = testArena();
+    defer a.deinit();
+    const merged = try mergeSettings(a.allocator(), "");
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a.allocator(), merged, .{});
+
+    const stop = parsed.object.get("hooks").?.object.get("Stop").?.array.items;
+    const commands = stop[stop.len - 1].object.get("hooks").?.array.items;
+    try testing.expectEqual(@as(usize, 2), commands.len);
+    try testing.expectEqualStrings(
+        "~/.claude/hooks/quality-gate.sh",
+        commands[0].object.get("command").?.string,
+    );
+    try testing.expectEqualStrings(
+        "~/.claude/hooks/commit-gate.sh",
+        commands[1].object.get("command").?.string,
+    );
+}
+
 test "the template's own hooks survive the merge, alongside policy's" {
     var a = testArena();
     defer a.deinit();
@@ -377,8 +413,10 @@ test "the instruction names the issue and says to fetch it" {
 test "the shipped hooks gate on CAPSULE_PROJECT_DIR, not a host path" {
     try testing.expect(std.mem.indexOf(u8, comment_guard, "CAPSULE_PROJECT_DIR") != null);
     try testing.expect(std.mem.indexOf(u8, quality_gate, "CAPSULE_PROJECT_DIR") != null);
+    try testing.expect(std.mem.indexOf(u8, commit_gate, "CAPSULE_PROJECT_DIR") != null);
+    try testing.expect(std.mem.indexOf(u8, handoff, "CAPSULE_PROJECT_DIR") != null);
 
-    for ([_][]const u8{ comment_guard, quality_gate }) |script| {
+    for ([_][]const u8{ comment_guard, quality_gate, commit_gate, handoff }) |script| {
         var lines = std.mem.splitScalar(u8, script, '\n');
         while (lines.next()) |line| {
             const code = std.mem.trimStart(u8, line, " \t");
@@ -398,10 +436,32 @@ test "the quality gate bounds its output and cannot trap the session" {
 
 test "the shipped scripts depend only on what the image actually has" {
     for ([_][]const u8{ "python", "perl", "node", "rg ", "fd " }) |absent| {
-        try testing.expect(std.mem.indexOf(u8, comment_guard, absent) == null);
-        try testing.expect(std.mem.indexOf(u8, quality_gate, absent) == null);
-        try testing.expect(std.mem.indexOf(u8, statusline, absent) == null);
+        for ([_][]const u8{ comment_guard, quality_gate, commit_gate, statusline, handoff }) |script| {
+            try testing.expect(std.mem.indexOf(u8, script, absent) == null);
+        }
     }
+}
+
+test "the commit gate cannot trap the session it blocks" {
+    try testing.expect(std.mem.indexOf(u8, commit_gate, "attempts") != null);
+    try testing.expect(std.mem.indexOf(u8, commit_gate, "capsule-gate-") != null);
+
+    // A commit needs an identity, and the mount that supplies it is skipped when the VM
+    // has no gitconfig. Blocking on a commit that cannot be made never terminates.
+    try testing.expect(std.mem.indexOf(u8, commit_gate, "user.email") != null);
+}
+
+test "the handoff commits without naming what wrote the work" {
+    try testing.expect(std.mem.indexOf(u8, handoff, "git commit") != null);
+    try testing.expect(std.mem.indexOf(u8, handoff, "Co-Authored-By") == null);
+    try testing.expect(std.mem.indexOf(u8, handoff, "Co-authored-by") == null);
+    try testing.expect(std.mem.indexOf(u8, handoff, "Generated with") == null);
+    try testing.expect(std.mem.indexOf(u8, handoff, "🤖") == null);
+}
+
+test "the handoff leaves its outcome where the host can still read it" {
+    // The tmux session ends the moment the script returns, taking the terminal with it.
+    try testing.expect(std.mem.indexOf(u8, handoff, "handoff.log") != null);
 }
 
 test "the status line asks the http endpoint, not MCP" {

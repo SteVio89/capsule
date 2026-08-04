@@ -87,8 +87,14 @@ pub fn podmanArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
 /// direnv's hook lives in bash's PROMPT_COMMAND, so it would not fire until the trailing
 /// `bash -l` — long after the agent had started without the project's devshell.
 ///
-/// That shell loops instead of a one-shot `exec`: it is the only thing keeping the
-/// container alive, and `exit` typed out of habit before committing should not tear it down.
+/// `handoff.sh` runs after the agent and is the last thing in the session, so quitting
+/// claude commits whatever is left and stops the container. An earlier version looped a
+/// fallback shell here to keep a habitual `exit` from tearing the container down before
+/// anything was committed; it made the session impossible to leave at all, which is the
+/// worse of the two failures. Committing on the way out addresses what the loop was for.
+///
+/// Only quitting the agent reaches this. Detaching from tmux, and the dropped ssh
+/// connection this whole arrangement exists for, leave the session running untouched.
 ///
 /// `--append-system-prompt` carries `sandbox_caveat`, so claude does not infer a real
 /// sandbox from `IS_SANDBOX=1` (set in `podmanArgs`) and start treating its actual
@@ -99,8 +105,8 @@ pub fn sessionCommand(arena: std.mem.Allocator, cfg: Config) ![]const u8 {
     }
 
     return std.fmt.allocPrint(arena,
-        \\tmux new-session -s capsule "direnv exec '{s}' claude --append-system-prompt '{s}' 'Work on issue {s}. Call get_issue first for the description and the project memory, then set_state in_progress.' ; while :; do bash -l; done"
-    , .{ cfg.project_dir, sandbox_caveat, cfg.issue_short });
+        \\tmux new-session -s capsule "direnv exec '{s}' claude --append-system-prompt '{s}' 'Work on issue {s}. Call get_issue first for the description and the project memory, then set_state in_progress.' ; {s}/.claude/handoff.sh"
+    , .{ cfg.project_dir, sandbox_caveat, cfg.issue_short, cfg.container_home });
 }
 
 const sandbox_caveat =
@@ -286,7 +292,7 @@ test "a login session carries no system-prompt caveat, since it starts no agent"
     try testing.expect(std.mem.indexOf(u8, command, "--append-system-prompt") == null);
 }
 
-test "the session runs the agent under tmux and falls through to a shell" {
+test "the session runs the agent under tmux and hands off when it exits" {
     var a = testArena();
     defer a.deinit();
     const command = try sessionCommand(a.allocator(), example);
@@ -294,16 +300,32 @@ test "the session runs the agent under tmux and falls through to a shell" {
     try testing.expect(std.mem.indexOf(u8, command, "tmux new-session") != null);
     try testing.expect(std.mem.indexOf(u8, command, "018f2a1c") != null);
     try testing.expect(std.mem.indexOf(u8, command, "get_issue") != null);
-    try testing.expect(std.mem.indexOf(u8, command, "bash -l") != null);
+    try testing.expect(std.mem.indexOf(u8, command, "/home/agent/.claude/handoff.sh") != null);
 }
 
-test "the fallback shell respawns instead of exiting, so exit cannot kill the container" {
+test "nothing outlives the agent, so quitting it stops the container" {
     var a = testArena();
     defer a.deinit();
     const command = try sessionCommand(a.allocator(), example);
 
-    try testing.expect(std.mem.indexOf(u8, command, "while :; do bash -l; done") != null);
-    try testing.expect(std.mem.indexOf(u8, command, "exec bash -l") == null);
+    try testing.expect(std.mem.indexOf(u8, command, "while :; do bash -l; done") == null);
+    try testing.expect(std.mem.indexOf(u8, command, "bash -l") == null);
+}
+
+test "the handoff is the last command, or the container stops before it commits" {
+    var a = testArena();
+    defer a.deinit();
+    const command = try sessionCommand(a.allocator(), example);
+    try testing.expect(std.mem.endsWith(u8, command, "handoff.sh\""));
+}
+
+test "the handoff path follows the container's home, not a hardcoded one" {
+    var a = testArena();
+    defer a.deinit();
+    var elsewhere = example;
+    elsewhere.container_home = "/root";
+    const command = try sessionCommand(a.allocator(), elsewhere);
+    try testing.expect(std.mem.indexOf(u8, command, "/root/.claude/handoff.sh") != null);
 }
 
 test "a login session has no issue and starts no agent" {

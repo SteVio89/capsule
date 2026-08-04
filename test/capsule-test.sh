@@ -166,7 +166,7 @@ check "--force wipes without asking about branches"       "removed replica myrep
 # `tmux` with the rest as positional parameters — an unnamed session, and no agent. The
 # nested quoting around direnv and the prompt is what makes the split worth guarding.
 container_line="'podman' 'run' '-d' '-t' '--name' 'capsule-x' '-w' '/proj' 'img' '-lc' \
-'tmux new-session -s capsule \"direnv exec '\''/proj'\'' claude '\''Work on issue 018f2a1c.'\'' ; exec bash -l\"'"
+'tmux new-session -s capsule \"direnv exec '\''/proj'\'' claude '\''Work on issue 018f2a1c.'\'' ; /home/agent/.claude/handoff.sh\"'"
 
 mkdir -p "$work/argv"
 # shellcheck disable=SC2016  # single-quoted: this is the fake podman's script, not expanded here
@@ -175,7 +175,7 @@ chmod +x "$work/argv/podman"
 remote_argv() { PATH="$work/argv:$PATH" sh -c "$container_line"; }
 
 check "the session command reaches podman as one argument" \
-  'tmux new-session -s capsule "direnv exec '\''/proj'\'' claude '\''Work on issue 018f2a1c.'\'' ; exec bash -l"' \
+  'tmux new-session -s capsule "direnv exec '\''/proj'\'' claude '\''Work on issue 018f2a1c.'\'' ; /home/agent/.claude/handoff.sh"' \
   "$(remote_argv | grep -A1 -x -- '-lc' | tail -1)"
 check "one parse leaves podman 10 arguments" "10" "$(remote_argv | wc -l | tr -d ' ')"
 

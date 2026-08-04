@@ -238,7 +238,7 @@ a container where there is no socket to talk to.
 |---|---|
 | `run start [issue]` | pick (or name) an issue, start the agent container for it |
 | `run attach` | reattach to the live run's tmux session |
-| `run end` | end the live run and remove its container |
+| `run end` | end the live run and remove its container, from the host |
 | `run reset [--force]` | remove this project from the VM entirely, and the `vm` remote with it |
 | `run list` | the project's runs and their states |
 | `run push [issue]` | `git push vm HEAD:capsule/<issue-id>` |
@@ -246,12 +246,28 @@ a container where there is no socket to talk to.
 | `run review [issue]` | review the issue's branch in [tuicr](https://tuicr.dev), PR-style |
 | `run merge [issue]` | diffstat, confirm, **squash-merge** as one commit, mark the issue done |
 
-When a run dies with its container, the daemon sees the container gone and marks the run
-`abandoned` on its next poll — but only while the VM answers. If it does not, the run
-stays `active` and refuses the next `run start`; `run end` clears it, and needs no VM for
-that. The issue is left in `in_progress` either way, and `run start` offers it again — it
-resumes on the branch it already has. Use `issue state <id> open` when you are putting
-the work down rather than picking it back up, so the backlog reads honestly.
+Quitting the agent ends the run. The container commits anything still uncommitted, stops
+itself, and `run attach` returns to your own shell with a report of what was committed.
+Detaching does not do this: `ctrl-b d`, a dropped ssh connection and a closed laptop all
+leave the session running, which is what the tmux-inside-the-container arrangement is for.
+`run end` is the same thing driven from the host, for a run you do not want to attach to
+first.
+
+Nothing is lost by stopping a container — the project directory is a bind mount of the
+replica on the VM and outlives it. What a container stop can cost you is *visibility*:
+`run merge` reads `HEAD..vm/<branch>` and sees commits only, so an uncommitted tree is
+work nobody will be offered. Two things prevent that, and both live in the run's
+agent-state directory — see [`src/assets`](src/assets/README.md): a `Stop` hook that will
+not let a turn end on a dirty tree, and a handoff script that commits whatever the agent
+could not.
+
+When a run dies with its container some other way — a crash, a killed VM — the daemon sees
+the container gone and marks the run `abandoned` on its next poll, but only while the VM
+answers. If it does not, the run stays `active` and refuses the next `run start`; `run
+end` clears it, and needs no VM for that. The issue is left in `in_progress` either way,
+and `run start` offers it again — it resumes on the branch it already has. Use `issue
+state <id> open` when you are putting the work down rather than picking it back up, so the
+backlog reads honestly.
 
 `run reset` is the undo for everything `run start` built outside your working tree: the
 replica in the VM, every per-run seed directory, the containers, and the `vm` remote —
