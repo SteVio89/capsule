@@ -169,6 +169,7 @@ container_line="'podman' 'run' '-d' '-t' '--name' 'capsule-x' '-w' '/proj' 'img'
 'tmux new-session -s capsule \"direnv exec '\''/proj'\'' claude '\''Work on issue 018f2a1c.'\'' ; exec bash -l\"'"
 
 mkdir -p "$work/argv"
+# shellcheck disable=SC2016  # single-quoted: this is the fake podman's script, not expanded here
 printf '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n' > "$work/argv/podman"
 chmod +x "$work/argv/podman"
 remote_argv() { PATH="$work/argv:$PATH" sh -c "$container_line"; }
@@ -179,7 +180,10 @@ check "the session command reaches podman as one argument" \
 check "one parse leaves podman 10 arguments" "10" "$(remote_argv | wc -l | tr -d ' ')"
 
 check "no eval wraps a capsuled-built command line" "" \
-  "$(grep -n 'eval \$cmd' "$cap" | paste -sd, -)"
+  "$(
+    # shellcheck disable=SC2016  # literal grep pattern, not expansion
+    grep -n 'eval \$cmd' "$cap" | paste -sd, -
+  )"
 
 check "help never mentions a renamed-away verb" "" \
   "$({ capsule help; capsule env; capsule vm; capsule image; capsule run; } 2>&1 \
