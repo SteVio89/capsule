@@ -613,13 +613,16 @@ cmd_run_merge() {
   git diff --stat "HEAD...vm/$branch"
   echo
 
-  local title message
+  local title message rc=0
   title=$(capsuled issue.get "$(project_params),\"id\":$(json_string "$issue")}" | jq -r '.title')
+  # Under 'set -e' a bare assignment from a command substitution exits the shell on a
+  # non-zero status, so the code has to be caught here rather than read from $? below.
   message=$(capsuled edit "$title" \
-    "<!-- the commit message for this merge. it is authored by you, not generated. empty aborts. -->")
-  case $? in
+    "<!-- the commit message for this merge. it is authored by you, not generated. empty aborts. -->") \
+    || rc=$?
+  case $rc in
     0) ;;
-    3) message="$title" ;;
+    3) message="$title" ;;   # saved unedited — the title is the message
     *) echo "aborted"; return 1 ;;
   esac
 
