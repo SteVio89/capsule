@@ -76,15 +76,25 @@ pub fn podmanArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
 ///
 /// That shell loops instead of a one-shot `exec`: it is the only thing keeping the
 /// container alive, and `exit` typed out of habit before committing should not tear it down.
+///
+/// `--append-system-prompt` carries `sandbox_caveat`, so claude does not infer a real
+/// sandbox from `IS_SANDBOX=1` (set in `podmanArgs`) and start treating its actual
+/// network and filesystem access as denied.
 pub fn sessionCommand(arena: std.mem.Allocator, cfg: Config) ![]const u8 {
     if (cfg.issue_short.len == 0) {
         return arena.dupe(u8, "tmux new-session -s capsule");
     }
 
     return std.fmt.allocPrint(arena,
-        \\tmux new-session -s capsule "direnv exec '{s}' claude 'Work on issue {s}. Call get_issue first for the description and the project memory, then set_state in_progress.' ; while :; do bash -l; done"
-    , .{ cfg.project_dir, cfg.issue_short });
+        \\tmux new-session -s capsule "direnv exec '{s}' claude --append-system-prompt '{s}' 'Work on issue {s}. Call get_issue first for the description and the project memory, then set_state in_progress.' ; while :; do bash -l; done"
+    , .{ cfg.project_dir, sandbox_caveat, cfg.issue_short });
 }
+
+const sandbox_caveat =
+    "IS_SANDBOX=1 is set only to satisfy the bypassPermissions check that claude " ++
+    "requires when running as root. This container is not otherwise restricted: it has " ++
+    "full network access via host networking, a mounted docker socket, and a writable " ++
+    "project directory. Do not assume network or filesystem restrictions apply.";
 
 /// `capsule run attach` — ssh, into the container, into tmux.
 pub fn attachArgs(arena: std.mem.Allocator, container_name: []const u8) ![]const []const u8 {
@@ -225,6 +235,26 @@ test "the agent starts inside the project's direnv environment" {
         command,
         "direnv exec '/var/home/core/capsule/api-f23e31bc' claude ",
     ) != null);
+}
+
+test "claude is told IS_SANDBOX is only for the root check, not a real restriction" {
+    var a = testArena();
+    defer a.deinit();
+    const command = try sessionCommand(a.allocator(), example);
+
+    try testing.expect(std.mem.indexOf(u8, command, "--append-system-prompt '") != null);
+    try testing.expect(std.mem.indexOf(u8, command, "IS_SANDBOX=1 is set only to satisfy") != null);
+    try testing.expect(std.mem.indexOf(u8, command, "full network access") != null);
+}
+
+test "a login session carries no system-prompt caveat, since it starts no agent" {
+    var a = testArena();
+    defer a.deinit();
+    var login = example;
+    login.issue_short = "";
+    const command = try sessionCommand(a.allocator(), login);
+
+    try testing.expect(std.mem.indexOf(u8, command, "--append-system-prompt") == null);
 }
 
 test "the session runs the agent under tmux and falls through to a shell" {
