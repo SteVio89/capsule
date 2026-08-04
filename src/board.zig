@@ -73,8 +73,11 @@ pub fn run(
                     'r' => break,
                     else => {},
                 },
-                .timeout => {},
                 .closed => return,
+                // The navigation keys are decoded but not yet bound: this view is still
+                // the read-only panel set, and binding them belongs with the list of
+                // issues that gives them something to move through.
+                else => {},
             }
         }
     }

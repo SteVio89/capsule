@@ -54,10 +54,100 @@ pub fn validProfile(name: []const u8) bool {
     return true;
 }
 
+/// A profile's directory: `${XDG_CONFIG_HOME:-$HOME/.config}/capsule/profiles/<name>`.
+pub fn profileDir(
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    name: []const u8,
+) ![]const u8 {
+    if (environ.get("XDG_CONFIG_HOME")) |x| {
+        return std.fmt.allocPrint(arena, "{s}/capsule/profiles/{s}", .{ x, name });
+    }
+    const home = environ.get("HOME") orelse return error.NoHome;
+    return std.fmt.allocPrint(arena, "{s}/.config/capsule/profiles/{s}", .{ home, name });
+}
+
+/// One preference, from the one-bare-file-per-value layout `capsule login` writes.
+///
+/// The layout is kept as it is and simply read here, rather than moved into the store: it
+/// holds an OAuth token, it is documented as hand-editable, and there is no migration
+/// framework to move it with. `fallback` is returned for a missing or empty file, which is
+/// what keeps a fresh profile from stopping a run to ask.
+pub fn profilePref(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    profile: []const u8,
+    name: []const u8,
+    fallback: []const u8,
+) []const u8 {
+    const dir = profileDir(arena, environ, profile) catch return fallback;
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name }) catch return fallback;
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 16)) catch
+        return fallback;
+
+    // Trailing newline: the files are written by shell redirection and read by a shell
+    // `$(<file)`, which strips it. A token with a newline welded on authenticates nothing.
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return if (value.len == 0) fallback else value;
+}
+
 const testing = std.testing;
 
 fn testArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(testing.allocator);
+}
+
+fn testEnv(
+    arena: std.mem.Allocator,
+    pairs: []const [2][]const u8,
+) !std.process.Environ.Map {
+    var env = std.process.Environ.Map.init(arena);
+    for (pairs) |p| try env.put(p[0], p[1]);
+    return env;
+}
+
+test "a profile directory follows XDG when it is set, and HOME when it is not" {
+    var a = testArena();
+    defer a.deinit();
+
+    var home = try testEnv(a.allocator(), &.{.{ "HOME", "/home/me" }});
+    try testing.expectEqualStrings(
+        "/home/me/.config/capsule/profiles/work",
+        try profileDir(a.allocator(), &home, "work"),
+    );
+
+    var xdg = try testEnv(a.allocator(), &.{ .{ "HOME", "/home/me" }, .{ "XDG_CONFIG_HOME", "/cfg" } });
+    try testing.expectEqualStrings(
+        "/cfg/capsule/profiles/work",
+        try profileDir(a.allocator(), &xdg, "work"),
+    );
+}
+
+test "a missing preference falls back rather than failing the run" {
+    var a = testArena();
+    defer a.deinit();
+
+    var env = try testEnv(a.allocator(), &.{.{ "HOME", "/nonexistent-capsule-test" }});
+    try testing.expectEqualStrings(
+        "dark",
+        profilePref(a.allocator(), testing.io, &env, "default", "theme", "dark"),
+    );
+    try testing.expectEqualStrings(
+        "",
+        profilePref(a.allocator(), testing.io, &env, "default", "token", ""),
+    );
+}
+
+test "no HOME and no XDG is a fallback, not an error the caller must handle" {
+    var a = testArena();
+    defer a.deinit();
+    var env = try testEnv(a.allocator(), &.{});
+    try testing.expectError(error.NoHome, profileDir(a.allocator(), &env, "work"));
+    try testing.expectEqualStrings(
+        "vim",
+        profilePref(a.allocator(), testing.io, &env, "work", "editor-mode", "vim"),
+    );
 }
 
 test "a relative .git is resolved against the cwd it was reported from" {

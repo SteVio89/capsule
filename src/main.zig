@@ -1,7 +1,7 @@
-//! capsuled: one binary, three roles — daemon, MCP endpoint, dashboard client.
+//! capsule: one binary, three roles — daemon, MCP endpoint, dashboard client.
 
 const std = @import("std");
-const capsuled = @import("capsuled");
+const capsule = @import("capsule");
 
 /// A panic while the board holds the terminal in raw mode on the alternate screen would
 /// otherwise leave the user's shell unusable and the panic message invisible. Restore
@@ -9,24 +9,9 @@ const capsuled = @import("capsuled");
 pub const panic = std.debug.FullPanic(panicWithTerminalRestored);
 
 fn panicWithTerminalRestored(msg: []const u8, first_trace_addr: ?usize) noreturn {
-    capsuled.tui.term.emergencyRestore();
+    capsule.tui.term.emergencyRestore();
     std.debug.defaultPanic(msg, first_trace_addr);
 }
-
-const usage =
-    \\usage: capsuled <command> [params-json]
-    \\
-    \\  daemon              run the host daemon: store, world model, MCP endpoint
-    \\  version             print the version and exit
-    \\
-    \\Anything else is sent to the daemon as a method name, with the optional second
-    \\argument passed through as its params object. The response's `result` is printed
-    \\on stdout; an error prints its message on stderr and exits 1.
-    \\
-    \\  capsuled ping
-    \\  capsuled daemon.status
-    \\
-;
 
 /// Dispatches on argv[1] and returns the process exit code, which bash branches on.
 pub fn main(init: std.process.Init) !u8 {
@@ -40,48 +25,59 @@ pub fn main(init: std.process.Init) !u8 {
     var err = std.Io.File.stderr().writer(init.io, &err_buf);
     defer err.interface.flush() catch {};
 
-    var args = init.minimal.args.iterate();
-    _ = args.next();
-    const command = args.next() orelse {
-        try out.interface.writeAll(usage);
+    var argv: std.ArrayList([]const u8) = .empty;
+    var it = init.minimal.args.iterate();
+    const exe_path = it.next() orelse "capsule";
+    while (it.next()) |a| try argv.append(arena, a);
+
+    const command = if (argv.items.len > 0) argv.items[0] else {
+        try capsule.cli.writeRootHelp(&out.interface, styleFor(init.io));
         return 2;
     };
 
+    // Positional reads of everything after the command, replacing the iterator so the
+    // argument list can also be resolved against the command table further down.
+    const rest = argv.items[1..];
+    var taken: usize = 0;
+
     if (std.mem.eql(u8, command, "version")) {
-        try out.interface.writeAll("capsuled 0.1.0\n");
+        try out.interface.writeAll("capsule 0.1.0\n");
         return 0;
     }
 
-    const paths = capsuled.paths.resolve(arena, .{
+    const paths = capsule.paths.resolve(arena, .{
         .home = init.environ_map.get("HOME"),
         .xdg_data_home = init.environ_map.get("XDG_DATA_HOME"),
         .capsule_socket = init.environ_map.get("CAPSULE_SOCKET"),
         .capsule_db = init.environ_map.get("CAPSULE_DB"),
     }) catch |e| {
-        try err.interface.print("capsuled: {t}\n", .{e});
+        try err.interface.print("capsule: {t}\n", .{e});
         return 1;
     };
 
-    if (std.mem.eql(u8, command, "daemon")) {
+    // Loaded for every command, daemon included. The daemon is started by launchd or
+    // systemd with a bare environment, so until now it read none of this — every knob it
+    // actually uses was configurable only for the process that did not need it.
+    const settings = loadSettings(arena, init, &err.interface) catch return 1;
+
+    if (std.mem.eql(u8, command, "daemon") and rest.len == 0) {
         std.Io.Dir.cwd().createDirPath(init.io, paths.data_dir) catch {};
 
-        const ctl_dir = init.environ_map.get("CAPSULE_CTL_DIR") orelse
-            try std.fmt.allocPrint(arena, "{s}/control", .{paths.data_dir});
-        std.Io.Dir.cwd().createDirPath(init.io, ctl_dir) catch {};
+        std.Io.Dir.cwd().createDirPath(init.io, settings.control_dir) catch {};
 
-        var d = capsuled.daemon.Daemon.init(init.gpa, init.io, .{
+        var d = capsule.daemon.Daemon.init(init.gpa, init.io, .{
             .socket_path = paths.socket,
             .db_path = try arena.dupeZ(u8, paths.db),
             .ssh = .{
-                .vm_host = init.environ_map.get("CAPSULE_VM_HOST") orelse "core@localhost",
-                .vm_port = parsePort(init.environ_map.get("CAPSULE_VM_PORT"), 2222),
-                .control_dir = ctl_dir,
-                .mcp_port = parsePort(init.environ_map.get("CAPSULE_MCP_PORT"), 8765),
-                .image = init.environ_map.get("CAPSULE_IMAGE") orelse "",
+                .vm_host = settings.vm_host,
+                .vm_port = settings.vm_port,
+                .control_dir = settings.control_dir,
+                .mcp_port = settings.mcp_port,
+                .image = settings.image,
             },
-            .poll_interval_s = @max(1, parsePort(init.environ_map.get("CAPSULE_POLL_INTERVAL"), 3)),
+            .poll_interval_s = settings.poll_interval_s,
         }) catch |e| {
-            try err.interface.print("capsuled: cannot open {s}: {t}\n", .{ paths.db, e });
+            try err.interface.print("capsule: cannot open {s}: {t}\n", .{ paths.db, e });
             return 1;
         };
         defer d.deinit();
@@ -89,13 +85,13 @@ pub fn main(init: std.process.Init) !u8 {
         d.serve() catch |e| switch (e) {
             error.AlreadyRunning => {
                 try err.interface.print(
-                    "capsuled: already running on {s}\n",
+                    "capsule: already running on {s}\n",
                     .{paths.socket},
                 );
                 return 1;
             },
             else => {
-                try err.interface.print("capsuled: {t}\n", .{e});
+                try err.interface.print("capsule: {t}\n", .{e});
                 return 1;
             },
         };
@@ -103,8 +99,8 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "edit")) {
-        const seed = args.next() orelse "";
-        const header = args.next() orelse "";
+        const seed = take(rest, &taken) orelse "";
+        const header = take(rest, &taken) orelse "";
         const seeded = if (header.len > 0)
             try std.fmt.allocPrint(arena, "{s}\n{s}", .{ header, seed })
         else
@@ -112,8 +108,8 @@ pub fn main(init: std.process.Init) !u8 {
 
         const tmp = init.environ_map.get("TMPDIR") orelse
             init.environ_map.get("XDG_RUNTIME_DIR") orelse "/tmp";
-        const result = capsuled.editor.editText(arena, init.io, init.environ_map, seeded, tmp) catch |e| {
-            try err.interface.print("capsuled: editor failed: {t}\n", .{e});
+        const result = capsule.editor.editText(arena, init.io, init.environ_map, seeded, tmp) catch |e| {
+            try err.interface.print("capsule: editor failed: {t}\n", .{e});
             return 1;
         };
         switch (result.outcome) {
@@ -127,18 +123,18 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "seed")) {
-        const dir = args.next() orelse {
+        const dir = take(rest, &taken) orelse {
             try err.interface.writeAll(
-                "usage: capsuled seed <dir> <issue> <title> <project-dir> [port] [theme] [editor-mode]\n",
+                "usage: capsule seed <dir> <issue> <title> <project-dir> [port] [theme] [editor-mode]\n",
             );
             return 2;
         };
-        const issue_short = args.next() orelse "";
-        const title = args.next() orelse "";
-        const project_dir = args.next() orelse "";
-        const port = parsePort(args.next(), 8765);
-        const theme = orDefault(args.next(), "dark");
-        const editor_mode = orDefault(args.next(), "vim");
+        const issue_short = take(rest, &taken) orelse "";
+        const title = take(rest, &taken) orelse "";
+        const project_dir = take(rest, &taken) orelse "";
+        const port = parsePort(take(rest, &taken), 8765);
+        const theme = orDefault(take(rest, &taken), "dark");
+        const editor_mode = orDefault(take(rest, &taken), "vim");
 
         const template_path = try std.fmt.allocPrint(
             arena,
@@ -148,7 +144,7 @@ pub fn main(init: std.process.Init) !u8 {
         );
         const template = std.Io.Dir.cwd().readFileAlloc(init.io, template_path, arena, .limited(1 << 20)) catch "";
 
-        capsuled.seed.writeTree(arena, init.io, dir, template, .{
+        capsule.seed.writeTree(arena, init.io, dir, template, .{
             .issue_short = issue_short,
             .issue_title = title,
             .project_dir = project_dir,
@@ -156,7 +152,7 @@ pub fn main(init: std.process.Init) !u8 {
             .theme = theme,
             .editor_mode = editor_mode,
         }) catch |e| {
-            try err.interface.print("capsuled: cannot seed {s}: {t}\n", .{ dir, e });
+            try err.interface.print("capsule: cannot seed {s}: {t}\n", .{ dir, e });
             return 1;
         };
         return 0;
@@ -164,69 +160,185 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, command, "container-cmd") or std.mem.eql(u8, command, "attach-cmd")) {
         const is_attach = std.mem.eql(u8, command, "attach-cmd");
-        const name = args.next() orelse return 2;
+        const name = take(rest, &taken) orelse return 2;
 
-        const argv = if (is_attach)
-            try capsuled.run.attachArgs(arena, name)
+        const cmd_argv = if (is_attach)
+            try capsule.run.attachArgs(arena, name)
         else
-            try capsuled.run.podmanArgs(arena, .{
+            try capsule.run.podmanArgs(arena, .{
                 .image = init.environ_map.get("CAPSULE_IMAGE") orelse "",
                 .container_home = init.environ_map.get("CAPSULE_CONTAINER_HOME") orelse "/home/agent",
                 .mcp_port = parsePort(init.environ_map.get("CAPSULE_MCP_PORT"), 8765),
                 .container_name = name,
-                .project_dir = args.next() orelse "",
-                .agent_state_dir = args.next() orelse "",
-                .env_file = args.next() orelse "",
-                .profile = args.next() orelse "default",
-                .issue_short = args.next() orelse "",
-                .git_config_path = args.next() orelse "",
+                .project_dir = take(rest, &taken) orelse "",
+                .agent_state_dir = take(rest, &taken) orelse "",
+                .env_file = take(rest, &taken) orelse "",
+                .profile = take(rest, &taken) orelse "default",
+                .issue_short = take(rest, &taken) orelse "",
+                .git_config_path = take(rest, &taken) orelse "",
             });
 
-        try out.interface.print("{s}\n", .{try capsuled.run.commandLine(arena, argv)});
+        try out.interface.print("{s}\n", .{try capsule.run.commandLine(arena, cmd_argv)});
         return 0;
     }
 
     if (std.mem.eql(u8, command, "board")) {
-        const project_params = args.next() orelse "";
-        capsuled.board.run(arena, init.gpa, init.io, paths.socket, project_params) catch |e| switch (e) {
+        const project_params = take(rest, &taken) orelse "";
+        capsule.board.run(arena, init.gpa, init.io, paths.socket, project_params) catch |e| switch (e) {
             error.DaemonNotRunning => {
-                try err.interface.writeAll("capsuled is not running — run 'capsule daemon start'\n");
+                try err.interface.writeAll("capsule is not running — run 'capsule daemon start'\n");
                 return 1;
             },
             error.NotATerminal => {
                 try err.interface.writeAll(
                     "capsule board needs a terminal. For something scriptable, use the CLI:\n" ++
-                        "  capsuled world.get\n",
+                        "  capsule world.get\n",
                 );
                 return 1;
             },
             else => {
-                try err.interface.print("capsuled: {t}\n", .{e});
+                try err.interface.print("capsule: {t}\n", .{e});
                 return 1;
             },
         };
         return 0;
     }
 
-    const params = args.next() orelse "{}";
-    const response = capsuled.client.call(arena, init.io, paths.socket, command, params) catch |e| switch (e) {
+    // The user-facing CLI. A name that is not a command group falls through to the raw
+    // method call below, which is what keeps `capsule ping` and `capsule world.get`
+    // working for the integration tests and for anything scripting the socket directly.
+    switch (capsule.cli.resolve(argv.items)) {
+        .unknown_group => {},
+        .root_help => {
+            try capsule.cli.writeRootHelp(&out.interface, styleFor(init.io));
+            return 0;
+        },
+        .group_help => |g| {
+            try capsule.cli.writeGroupHelp(&out.interface, g, styleFor(init.io));
+            return 0;
+        },
+        .unknown_verb => |u| {
+            try err.interface.print("capsule: unknown command '{s} {s}'\n", .{ u.group.name, u.verb });
+            try capsule.cli.writeGroupHelp(&err.interface, u.group, styleFor(init.io));
+            return 2;
+        },
+        .command => |c| {
+            const tail = if (c.isBare()) argv.items[1..] else argv.items[2..];
+            const flags = readFlags(tail);
+            var ctx = capsule.cmd.Ctx{
+                .arena = arena,
+                .io = init.io,
+                .settings = settings,
+                .socket = paths.socket,
+                .environ = init.environ_map,
+                .out = &out.interface,
+                .err = &err.interface,
+                .exe = exe_path,
+                .args = flags.args,
+                .json = flags.json,
+            };
+            return capsule.cmd.run(&ctx, c);
+        },
+    }
+
+    return rawCall(arena, init, paths.socket, command, if (rest.len > 0) rest[0] else "{}", &out.interface, &err.interface);
+}
+
+/// The next unread argument, or null. Replaces the argument iterator so the same list can
+/// be both consumed positionally and resolved against the command table.
+fn take(rest: []const []const u8, taken: *usize) ?[]const u8 {
+    if (taken.* >= rest.len) return null;
+    defer taken.* += 1;
+    return rest[taken.*];
+}
+
+/// Help carries colour only when it is going to a terminal, so a piped `capsule help`
+/// stays readable.
+fn styleFor(io: std.Io) capsule.cli.Style {
+    return capsule.cli.Style.forTty(std.Io.File.stdout().isTty(io) catch false);
+}
+
+/// `--json` is global rather than per-command: every handler that renders a table can
+/// print the daemon's object instead, and a scripted caller should not have to know which.
+fn readFlags(args: []const []const u8) struct { args: []const []const u8, json: bool } {
+    if (args.len > 0 and std.mem.eql(u8, args[args.len - 1], "--json")) {
+        return .{ .args = args[0 .. args.len - 1], .json = true };
+    }
+    return .{ .args = args, .json = false };
+}
+
+/// The escape hatch: a method name sent straight to the daemon. Kept because the
+/// integration tests and the agent-side tooling speak the protocol directly.
+fn rawCall(
+    arena: std.mem.Allocator,
+    init: std.process.Init,
+    socket: []const u8,
+    command: []const u8,
+    params: []const u8,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    const response = capsule.client.call(arena, init.io, socket, command, params) catch |e| switch (e) {
         error.DaemonNotRunning => {
-            try err.interface.writeAll("capsuled is not running — run 'capsule daemon start'\n");
+            try err.writeAll("capsule is not running — run 'capsule daemon start'\n");
             return 1;
         },
         else => {
-            try err.interface.print("capsuled: {t}\n", .{e});
+            try err.print("capsule: {t}\n", .{e});
             return 1;
         },
     };
 
     if (response.ok) {
-        try out.interface.print("{s}\n", .{response.body});
+        try out.print("{s}\n", .{response.body});
         return 0;
     }
-    try err.interface.print("capsuled: {s}\n", .{response.message orelse response.body});
-    if (response.hint) |h| try err.interface.print("  try: {s}\n", .{h});
+    try err.print("capsule: {s}\n", .{response.message orelse response.body});
+    if (response.hint) |h| try err.print("  try: {s}\n", .{h});
     return 1;
+}
+
+/// The config file layered over the environment, with anything unusable reported.
+///
+/// An unreadable line is a warning naming its line number, never a refusal: a stray line
+/// in a file that worked yesterday should cost one setting, not the whole tool. A value
+/// that would change the meaning of a remote command line is the exception — that is
+/// refused, exactly as the shell version refused a `CAPSULE_VM_HOST` without an `@`.
+fn loadSettings(
+    arena: std.mem.Allocator,
+    init: std.process.Init,
+    err: *std.Io.Writer,
+) !capsule.config.Config {
+    const environ = init.environ_map;
+
+    // Resolved too, not just parsed: the derived paths (data dir, control dir) must be
+    // filled in on this path as well, or losing the config file would silently hand the
+    // ssh layer an empty control directory and a ControlPath of "/cm-%C".
+    const fallback = blk: {
+        const base = capsule.config.fromEnv(environ);
+        break :blk capsule.config.resolve(arena, base, environ) catch base;
+    };
+
+    const path = capsule.config.defaultPath(arena, environ) catch return fallback;
+    const parsed = capsule.config.load(arena, init.io, path, environ) catch return fallback;
+
+    for (parsed.warnings) |w| {
+        err.print("capsule: {s}: line {d}: {s}\n", .{
+            path, w.line_no,
+            switch (w.kind) {
+                .malformed => "not a KEY=value setting — ignored",
+                .unknown_key => "unknown setting — ignored",
+                .bad_number => "expected a number — ignored",
+            },
+        }) catch {};
+    }
+
+    const resolved = capsule.config.resolve(arena, parsed.config, environ) catch parsed.config;
+    if (capsule.config.check(resolved)) |problem| {
+        err.print("capsule: {s} {s}\n", .{ problem.key, problem.reason }) catch {};
+        return error.BadConfig;
+    }
+    return resolved;
 }
 
 /// A malformed port in the environment falls back rather than refusing to start: the
@@ -245,5 +357,5 @@ fn orDefault(text: ?[]const u8, fallback: []const u8) []const u8 {
 }
 
 test {
-    _ = capsuled;
+    _ = capsule;
 }

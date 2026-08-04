@@ -24,11 +24,34 @@ pub const Color = enum {
             .dim => "2",
         };
     }
+
+    /// The same colour as a background. `dim` is an intensity attribute rather than a
+    /// colour, so it has no background form and falls back to the terminal's own.
+    pub fn bgSgr(c: Color) []const u8 {
+        return switch (c) {
+            .default, .dim => "49",
+            .red => "41",
+            .green => "42",
+            .yellow => "43",
+            .blue => "44",
+            .cyan => "46",
+        };
+    }
 };
 
 pub const Style = struct {
     fg: Color = .default,
+    bg: Color = .default,
     bold: bool = false,
+    /// Swaps foreground and background. This is how a selected row is drawn, and its
+    /// absence is why the dashboard could only ever render counters: without it there is
+    /// no way to say "this line is the one you are on".
+    reverse: bool = false,
+
+    /// Field-by-field, because `Style` has no scalar identity and `==` does not apply.
+    pub fn eql(a: Style, b: Style) bool {
+        return a.fg == b.fg and a.bg == b.bg and a.bold == b.bold and a.reverse == b.reverse;
+    }
 };
 
 pub const Cell = struct {
@@ -92,9 +115,7 @@ pub const Screen = struct {
     pub fn rowsEqual(a: Screen, b: Screen, y: usize) bool {
         if (a.w != b.w) return false;
         for (a.row(y), b.row(y)) |x, z| {
-            if (x.ch != z.ch or x.style.fg != z.style.fg or x.style.bold != z.style.bold) {
-                return false;
-            }
+            if (x.ch != z.ch or !x.style.eql(z.style)) return false;
         }
         return true;
     }

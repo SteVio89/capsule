@@ -5,6 +5,7 @@ const net = std.Io.net;
 const Io = std.Io;
 
 const protocol = @import("protocol.zig");
+const client_mod = @import("client.zig");
 const store_mod = @import("store.zig");
 const paths_mod = @import("paths.zig");
 const world_mod = @import("world.zig");
@@ -260,10 +261,14 @@ pub const Daemon = struct {
     /// reach the MCP port, and one silent connect must not wedge a serial accept loop
     /// forever. Best-effort — a platform refusing the option just keeps today's behaviour.
     fn setSocketTimeouts(stream: net.Stream, seconds: i32) void {
+        // libc's setsockopt rather than std's: a peer that closed between accept and here
+        // makes the call return EINVAL, and std maps EINVAL to `unreachable`, so a client
+        // that connects and hangs up — a liveness probe does exactly that — panics the
+        // daemon. A failed timeout is not worth dying for, so the result is ignored.
         const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
-        const bytes = std.mem.asBytes(&timeout);
-        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
-        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
+        const len: std.posix.socklen_t = @sizeOf(std.posix.timeval);
+        _ = std.c.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout, len);
+        _ = std.c.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout, len);
     }
 
     /// `capsule project` — register, list, retire, and set the profile.
@@ -1699,14 +1704,13 @@ fn clearStaleSocket(io: Io, path: []const u8) !void {
         return;
     }
 
-    const addr = try net.UnixAddress.init(path);
-    if (addr.connect(io)) |stream| {
-        var s = stream;
-        s.close(io);
-        return error.AlreadyRunning;
-    } else |_| {
-        Io.Dir.cwd().deleteFile(io, path) catch {};
-    }
+    _ = try net.UnixAddress.init(path);
+
+    // `client.listening` rather than a connect through `Io.net`: a stale socket with
+    // nothing behind it is the expected case here, and that path dumps a stack trace in
+    // Debug builds — into the daemon's own startup log, where it reads as a crash.
+    if (client_mod.listening(path)) return error.AlreadyRunning;
+    Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
 const testing = std.testing;

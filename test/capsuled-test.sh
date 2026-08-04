@@ -2,7 +2,7 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-capsuled="${CAPSULED:-$here/../zig-out/bin/capsuled}"
+capsuled="${CAPSULE_BIN:-$here/../zig-out/bin/capsule}"
 
 if [[ ! -x $capsuled ]]; then
   echo "capsuled not found at $capsuled — run 'zig build' first, or set CAPSULED" >&2

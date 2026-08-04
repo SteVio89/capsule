@@ -31,8 +31,11 @@ pub fn call(
     params_json: []const u8,
 ) !Response {
     const addr = net.UnixAddress.init(socket_path) catch return error.DaemonNotRunning;
+    if (!listening(socket_path)) return error.DaemonNotRunning;
     var stream = addr.connect(io) catch return error.DaemonNotRunning;
     defer stream.close(io);
+
+    setReceiveTimeout(stream, 30);
 
     const write_buf = try arena.alloc(u8, protocol.max_line);
     var writer = stream.writer(io, write_buf);
@@ -48,6 +51,57 @@ pub fn call(
     const line = maybe_line orelse return error.BadResponse;
 
     return parseResponse(arena, line);
+}
+
+/// Whether anything is listening, without exchanging a message.
+///
+/// Liveness is a connect, not a round trip. A daemon mid-shutdown can accept and then
+/// never reply, so a `ping`-based poll blocks for its whole timeout on every iteration;
+/// connecting answers immediately in both directions, because a unix socket with no
+/// listener refuses at once.
+pub fn alive(socket_path: []const u8) bool {
+    return listening(socket_path);
+}
+
+/// Whether a listener is accepting on the unix socket at `path`.
+///
+/// Deliberately `std.c` rather than `Io.net`: `posixConnectUnix` does not classify
+/// `ECONNREFUSED`, so it reaches `posix.unexpectedErrno`, which dumps a stack trace in
+/// Debug builds. That makes the single most ordinary outcome in this whole program —
+/// nothing is listening, because the daemon is not running — look like a crash, on every
+/// command, and it fills the daemon's own log with them.
+///
+/// A connect is the liveness test rather than a round trip: a daemon mid-shutdown can
+/// accept and then never reply, so a `ping`-based poll blocks for its whole timeout on
+/// every iteration, while a socket with no listener refuses at once.
+pub fn listening(path: []const u8) bool {
+    var addr: std.c.sockaddr.un = .{ .path = undefined };
+    if (path.len >= addr.path.len) return false;
+    @memset(&addr.path, 0);
+    @memcpy(addr.path[0..path.len], path);
+
+    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = std.c.close(fd);
+
+    return std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) == 0;
+}
+
+/// A connected socket that never answers would block the CLI forever: `takeDelimiter`
+/// waits for a newline that is not coming.
+///
+/// This is reachable in ordinary use. A daemon that has been told to stop can still accept
+/// a queued connection and then exit without replying, so the very next `ping` hangs — the
+/// daemon guards its own accept loop the same way, for the mirror-image reason.
+///
+/// Best-effort: a platform that refuses the option keeps today's behaviour.
+fn setReceiveTimeout(stream: net.Stream, seconds: i32) void {
+    // libc's setsockopt, not std's: std maps EINVAL to `unreachable`, and a socket whose
+    // peer has already gone returns exactly that. A missing timeout is not worth a panic.
+    const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
+    const len: std.posix.socklen_t = @sizeOf(std.posix.timeval);
+    _ = std.c.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout, len);
+    _ = std.c.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout, len);
 }
 
 /// Pure, so the shapes a daemon can return are covered without a socket.
@@ -95,6 +149,19 @@ const testing = std.testing;
 
 fn testArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(testing.allocator);
+}
+
+test "nothing listening is a quiet false, not a stack trace" {
+    // The regression this pins is cosmetic but expensive: `Io.net`'s connect does not
+    // classify ECONNREFUSED, so it reaches `posix.unexpectedErrno`, which dumps a stack
+    // trace in Debug builds. "The daemon is not running" is the most common state this
+    // program is ever in, and it must not print like a crash. Twice now it has.
+    try testing.expect(!listening("/nonexistent/capsule-test/capsuled.sock"));
+    try testing.expect(!alive("/nonexistent/capsule-test/capsuled.sock"));
+
+    // A path over the sockaddr_un limit is refused rather than truncated into a
+    // different, possibly live, socket.
+    try testing.expect(!listening("/" ++ "x" ** 200));
 }
 
 test "a success response yields its result verbatim" {
