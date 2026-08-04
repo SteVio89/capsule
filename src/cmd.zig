@@ -1341,8 +1341,28 @@ fn unmergedIsEmpty(ctx: *Ctx, replica: []const u8) bool {
         .err => |f| return failure(ctx, f) == 0,
     };
 
-    var unmerged: std.ArrayList([]const u8) = .empty;
-    var lines = std.mem.splitScalar(u8, listed.stdout, '\n');
+    const unmerged = unmergedBranches(ctx.arena, listed.stdout, merged) catch return false;
+    if (unmerged.len == 0) return true;
+
+    ctx.err.writeAll("capsule: the replica still holds unmerged work:\n") catch {};
+    for (unmerged) |b| ctx.err.print("  {s}\n", .{b}) catch {};
+    _ = ctx.fail("'capsule run fetch' brings the branches here first; --force drops them", .{});
+    return false;
+}
+
+/// The branches on the replica that `gc.branches` did not report as merged.
+///
+/// Split out from the ssh and the RPC because this set difference is the whole refusal:
+/// `run reset` destroys the replica, and the only thing standing between that and losing
+/// an agent's work is this comparison. bash did it with `comm -23` over two sorted
+/// streams, which is where `test/capsule-test.sh`'s reset checks were aimed.
+fn unmergedBranches(
+    arena: std.mem.Allocator,
+    replica_listing: []const u8,
+    merged: []const []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, replica_listing, '\n');
     while (lines.next()) |raw| {
         const branch = std.mem.trim(u8, raw, " \t\r");
         if (branch.len == 0) continue;
@@ -1350,14 +1370,9 @@ fn unmergedIsEmpty(ctx: *Ctx, replica: []const u8) bool {
         for (merged) |m| {
             if (std.mem.eql(u8, m, branch)) is_merged = true;
         }
-        if (!is_merged) unmerged.append(ctx.arena, branch) catch return false;
+        if (!is_merged) try out.append(arena, branch);
     }
-    if (unmerged.items.len == 0) return true;
-
-    ctx.err.writeAll("capsule: the replica still holds unmerged work:\n") catch {};
-    for (unmerged.items) |b| ctx.err.print("  {s}\n", .{b}) catch {};
-    _ = ctx.fail("'capsule run fetch' brings the branches here first; --force drops them", .{});
-    return false;
+    return out.toOwnedSlice(arena);
 }
 
 /// Drops the `vm` remote, which takes `refs/remotes/vm/*` with it — so the replica's
@@ -2284,10 +2299,6 @@ fn imagePull(ctx: *Ctx) u8 {
 /// One ssh round trip carrying the source tarball on stdin, where bash made four: remove,
 /// mkdir, extract, build. The tarball is capsule's own source, not the user's project —
 /// `CAPSULE_SRC` names it, as it did in bash, falling back to the working directory.
-///
-/// TODO(phase-7): the tar still ships `bin/`, which is `bin/capsule`. When that is deleted
-/// this sends the cross-compiled binary instead, and `container/Dockerfile:20` changes
-/// with it.
 fn imageBuild(ctx: *Ctx) u8 {
     const src = ctx.environ.get("CAPSULE_SRC") orelse
         (git.realpath(ctx.arena, ctx.io, ".") catch return ctx.fail("cannot resolve the working directory", .{}));
@@ -2326,6 +2337,10 @@ fn imageBuild(ctx: *Ctx) u8 {
 
 /// Tars capsule's own source for shipping to the VM.
 ///
+/// The members are the podman build context `container/Dockerfile` expects: the container
+/// definition, and the Zig source it builds capsule from. `bin/` is gone with the shell
+/// CLI, and `share/` no longer travels — the templates are embedded in the binary.
+///
 /// `COPYFILE_DISABLE=1` is a macOS thing: without it bsdtar adds an `AppleDouble` `._*`
 /// member beside every file, which the Linux side then unpacks as litter.
 fn packSource(ctx: *Ctx, src: []const u8) ?Io.File {
@@ -2338,10 +2353,13 @@ fn packSource(ctx: *Ctx, src: []const u8) ?Io.File {
     environ.put("COPYFILE_DISABLE", "1") catch return null;
 
     const out = exec.run(ctx.arena, ctx.io, &.{
-        "tar",  "czf",       path,
-        "-C",   src,         "--exclude",
-        ".git", "--exclude", ".direnv",
-        "bin",  "container", "share",
+        "tar",           "czf",            path,
+        "-C",            src,              "--exclude",
+        ".git",          "--exclude",      ".direnv",
+        "--exclude",     ".zig-cache",     "--exclude",
+        "zig-out",       "container",      "src",
+        "share",         "config.example", "build.zig",
+        "build.zig.zon", "flake.nix",      "flake.lock",
     }, .{ .environ = &environ }) catch |e| {
         _ = ctx.fail("could not pack the source: {t}", .{e});
         return null;
@@ -2918,6 +2936,48 @@ test "the short form of an id is its last eight characters" {
     try testing.expectEqualStrings("abc", shortId("abc"));
     try testing.expectEqualStrings("", shortId(""));
     try testing.expectEqualStrings("12345678", shortId("12345678"));
+}
+
+test "reset refuses on a branch whose issue is not done" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Ported from `test/capsule-test.sh`. `run reset` destroys the replica; this set
+    // difference is the only thing between that and an agent's uncommitted work.
+    const on_replica = "capsule/aaa\ncapsule/bbb\ncapsule/ccc\n";
+    const merged: []const []const u8 = &.{ "capsule/aaa", "capsule/ccc" };
+
+    const unmerged = try unmergedBranches(a, on_replica, merged);
+    try testing.expectEqual(@as(usize, 1), unmerged.len);
+    try testing.expectEqualStrings("capsule/bbb", unmerged[0]);
+}
+
+test "reset keeps a done branch out of the refusal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const merged: []const []const u8 = &.{ "capsule/aaa", "capsule/bbb" };
+    try testing.expectEqual(
+        @as(usize, 0),
+        (try unmergedBranches(a, "capsule/aaa\ncapsule/bbb\n", merged)).len,
+    );
+
+    // A replica with nothing on it, and blank lines from the remote, are both "nothing to
+    // refuse over" rather than a branch named "".
+    try testing.expectEqual(@as(usize, 0), (try unmergedBranches(a, "", merged)).len);
+    try testing.expectEqual(@as(usize, 0), (try unmergedBranches(a, "\n\n  \n", merged)).len);
+}
+
+test "an empty merged set means every branch on the replica is unmerged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // The direction that matters: a daemon answering with nothing must not read as
+    // "everything is merged, go ahead and delete".
+    const unmerged = try unmergedBranches(arena.allocator(), "capsule/aaa\ncapsule/bbb\n", &.{});
+    try testing.expectEqual(@as(usize, 2), unmerged.len);
 }
 
 test "vm ssh hands its arguments to the remote shell, as plain ssh does" {

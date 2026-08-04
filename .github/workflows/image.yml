@@ -5,8 +5,12 @@ on:
     branches: [main]
     paths:
       - container/**
-      - bin/capsule
-      - share/**
+      # The image builds capsule from source, so any change to it changes the image.
+      - src/**
+      - build.zig
+      - build.zig.zon
+      - flake.nix
+      - flake.lock
       - .github/workflows/image.yml
   # No container flake.lock is committed, so every build re-locks nixpkgs to latest.
   # This weekly rebuild is what keeps claude-code and cursor-cli fresh.

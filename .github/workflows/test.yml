@@ -11,9 +11,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck bin/capsule test/capsule-test.sh test/capsuled-test.sh
-      - run: shellcheck -s sh src/assets/hooks/*.sh src/assets/statusline.sh
-      - run: bash test/capsule-test.sh
+      - run: shellcheck test/capsuled-test.sh
+      # The container's contract is POSIX sh plus curl, jq and just — nothing bash-only,
+      # because these run inside the image and not on the host. handoff.sh was missing
+      # from this list until the shell CLI it lived beside was deleted.
+      - run: shellcheck -s sh src/assets/hooks/*.sh src/assets/statusline.sh src/assets/handoff.sh
 
   zig:
     runs-on: ubuntu-24.04
@@ -27,4 +29,4 @@ jobs:
       - run: nix develop --command zig fmt --check src build.zig
       - run: nix develop --command zig build test
       - run: nix develop --command sh -c 'zig build && bash test/capsuled-test.sh'
-      - run: nix build .#capsuled
+      - run: nix build .#capsule

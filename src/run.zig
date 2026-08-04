@@ -444,6 +444,97 @@ fn expandsTo(arena: std.mem.Allocator, script: []const u8, name: []const u8) ![]
     return out.stdout;
 }
 
+/// Runs `command_line` through a real `sh` with a fake `podman` on PATH that echoes each
+/// argument on its own line, and hands back what podman saw.
+///
+/// This is the port of `test/capsule-test.sh:163-186`, the most load-bearing assertion the
+/// shell suite had. The property is not about text: it is that the command survives
+/// **exactly one** shell parse. A second one — an `eval`, an `sh -c`, a stray layer of
+/// quotes — splits the tmux command into separate podman arguments, and the agent gets an
+/// unnamed session with its instructions scattered across argv. Only a shell can tell you
+/// that, so a shell is asked.
+fn podmanSees(arena: std.mem.Allocator, command_line: []const u8) ![]const []const u8 {
+    const exec_mod = @import("exec.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const fake = try std.fmt.allocPrint(arena, "{s}/podman", .{dir});
+    {
+        var file = try std.Io.Dir.cwd().createFile(testing.io, fake, .{
+            .permissions = @enumFromInt(0o755),
+        });
+        defer file.close(testing.io);
+        var buf: [256]u8 = undefined;
+        var w = file.writer(testing.io, &buf);
+        try w.interface.writeAll("#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done\n");
+        try w.interface.flush();
+    }
+
+    const abs = try @import("git.zig").realpath(arena, testing.io, dir);
+    const script = try std.fmt.allocPrint(arena, "PATH={s}:$PATH; {s}", .{ abs, command_line });
+
+    const out = exec_mod.run(arena, testing.io, &.{ "sh", "-c", script }, .{}) catch
+        return error.SkipZigTest;
+    if (!out.ok()) return error.SkipZigTest;
+
+    var args: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out.stdout, "\n"), '\n');
+    while (lines.next()) |line| try args.append(arena, line);
+    return args.toOwnedSlice(arena);
+}
+
+test "the container command survives exactly one shell parse" {
+    var a = testArena();
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const argv = try podmanArgs(arena, example);
+    const seen = try podmanSees(arena, try commandLine(arena, argv));
+
+    // `argv[0]` is podman itself, which the fake sees as its own name rather than in
+    // `"$@"` — so what it reports is everything after it.
+    const expected = argv[1..];
+    try testing.expectEqual(expected.len, seen.len);
+    for (expected, seen) |built, got| try testing.expectEqualStrings(built, got);
+}
+
+test "the session command reaches podman as a single argument" {
+    var a = testArena();
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const seen = try podmanSees(arena, try commandLine(arena, try podmanArgs(arena, example)));
+
+    // The word after `-lc` is the whole tmux invocation. If a second parse had happened it
+    // would be just `tmux`, with the rest promoted to podman's own arguments.
+    var found: ?[]const u8 = null;
+    for (seen, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "-lc") and i + 1 < seen.len) found = seen[i + 1];
+    }
+    const session = found orelse return error.NoSessionArgument;
+    try testing.expectEqualStrings(try sessionCommand(arena, example), session);
+    try testing.expect(std.mem.indexOf(u8, session, "tmux new-session") != null);
+    try testing.expect(std.mem.indexOf(u8, session, "handoff.sh") != null);
+}
+
+test "a login container command survives the same single parse" {
+    var a = testArena();
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const argv = try loginArgs(arena, .{
+        .image = "ghcr.io/x/capsule:latest",
+        .profile = "work",
+        .state_dir = "/var/home/core/.capsule/profiles/work/claude",
+    });
+    const seen = try podmanSees(arena, try commandLine(arena, argv));
+    const expected = argv[1..];
+    try testing.expectEqual(expected.len, seen.len);
+    for (expected, seen) |built, got| try testing.expectEqualStrings(built, got);
+}
+
 test "a login container carries no run state and no unexpanded variable" {
     var a = testArena();
     defer a.deinit();

@@ -37,25 +37,47 @@
         {
           default = self.packages.${system}.capsule;
 
-          # One binary. `capsule daemon` is the service; there is no separate `capsuled`
-          # and no shell wrapper. Two packages both installing `bin/capsule` is what the
-          # rename of the Zig artifact turned into a buildEnv collision.
-          capsule = pkgs.stdenv.mkDerivation {
-            pname = "capsule";
+          # The binary alone. The container image builds this and nothing else: an agent
+          # runs `capsule env` against its own checkout and has no use for a host's ssh,
+          # qemu or tuicr, so wrapping it there would only enlarge the image.
+          capsule-unwrapped = pkgs.stdenv.mkDerivation {
+            pname = "capsule-unwrapped";
             version = "0.1.0";
             src = ./.;
 
-            nativeBuildInputs = [ pkgs.zig_0_16 pkgs.makeWrapper ];
+            nativeBuildInputs = [ pkgs.zig_0_16 ];
             zigBuildFlags = [ "--system" "${zigDeps}" ];
             zigCheckFlags = [ "--system" "${zigDeps}" ];
             doCheck = true;
 
-            postInstall = ''
+            meta = {
+              description = "capsule, without the host tool PATH";
+              mainProgram = "capsule";
+              platforms = systems;
+            };
+          };
+
+          # One binary. `capsule daemon` is the service; there is no separate `capsuled`
+          # and no shell wrapper. Two packages both installing `bin/capsule` is what the
+          # rename of the Zig artifact turned into a buildEnv collision.
+          capsule = pkgs.stdenvNoCC.mkDerivation {
+            pname = "capsule";
+            version = "0.1.0";
+            src = ./.;
+
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+
+            installPhase = ''
+              runHook preInstall
               # `capsule image build` ships this tree to the VM as the podman build
               # context, so the repo layout has to survive packaging.
               mkdir -p $out/libexec/capsule
-              cp -r bin container share $out/libexec/capsule/
-              wrapProgram $out/bin/capsule \
+              cp -r container share src config.example \
+                build.zig build.zig.zon flake.nix flake.lock \
+                $out/libexec/capsule/
+
+              makeWrapper ${self.packages.${system}.capsule-unwrapped}/bin/capsule \
+                $out/bin/capsule \
                 --set-default CAPSULE_SRC $out/libexec/capsule \
                 --prefix PATH : ${
                   pkgs.lib.makeBinPath (
@@ -66,6 +88,7 @@
                     ++ lib.optionals stdenv.isDarwin [ qemu butane xz ]
                   )
                 }
+              runHook postInstall
             '';
 
             meta = {

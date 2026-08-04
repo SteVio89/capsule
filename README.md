@@ -63,10 +63,9 @@ or credential helpers would only break the agent's commits inside the container.
 ## Requirements
 
 - [Nix](https://nixos.org/download) with flakes, and [direnv](https://direnv.net) — for the devshell commands
-- git, ssh, [fzf](https://github.com/junegunn/fzf), [jq](https://jqlang.github.io/jq/),
-  [tuicr](https://tuicr.dev) — the Nix package wires fzf, jq and tuicr in for you.
-  tuicr is what `run review` opens; without it the command falls back to `git log -p`
-- **`capsule vm start` only** (Apple Silicon host): qemu, butane, xz, jq, curl.
+- git, ssh, curl, tar, and [tuicr](https://tuicr.dev) — the Nix package wires them in for
+  you. tuicr is what `run review` opens; without it the command falls back to `git log -p`
+- **`capsule vm start` only** (Apple Silicon host): qemu, butane, xz.
   The Nix package wires these into `PATH` for you.
 
 The agent host can be anything reachable over ssh that runs rootless podman.
@@ -83,10 +82,12 @@ nix run github:stevio89/capsule -- help
 # or add to a profile / home-manager via the flake's `packages.default`
 ```
 
-Or just symlink the script — it resolves through symlinks to find `share/`:
+capsule is one binary. `capsule daemon` is the service the rest of it reads from; there is
+no separate `capsuled` and no wrapper script. Building it yourself needs only the devshell:
 
 ```sh
-ln -s "$PWD/bin/capsule" ~/.local/bin/capsule
+nix develop --command zig build
+ln -s "$PWD/zig-out/bin/capsule" ~/.local/bin/capsule
 ```
 
 ## Quick start
@@ -167,7 +168,8 @@ a real machine they refuse — that box is not capsule's to boot or erase.
 | `issue archive [id] -m <reason>` | set it aside, with a reason (reversible) |
 | `issue reopen [id]` | bring an archived issue back onto its existing branch |
 
-Omit the id and an fzf picker opens, with the issue body in the preview pane. Ids resolve
+Omit the id and a picker opens, matching on subsequences so `bord` finds "make the board
+useful" without the letters being adjacent. Ids resolve
 by unique prefix, as git resolves a short SHA, so the eight-character form shown by
 `issue list` is almost always enough.
 
@@ -210,9 +212,10 @@ VM state, uptime, disk, running containers, and `capsule/*` branches with commit
 than shelling out to `capsule vm status` on a timer — each of those would be a fresh ssh
 handshake, and several per refresh would be slow and flaky.
 
-**It is read-only and stays that way.** Every mutation goes through a CLI command: a
-keystroke cannot be piped, scripted, called from CI, invoked from a direnv hook, or
-written down in an issue thread.
+**Every mutation is a named command.** The board may eventually invoke them for you, but
+what it invokes will be the same command you could have typed — because a keystroke cannot
+be piped, scripted, called from CI, invoked from a direnv hook, or written down in an issue
+thread, and the command can.
 
 **`capsule daemon`** — the host service everything else reads from:
 
@@ -222,7 +225,7 @@ written down in an issue thread.
 | `daemon stop` | stop it |
 | `daemon status` | whether it is up, and what it is holding |
 
-`capsuled` owns the SQLite store, a polled model of the VM, and the loopback endpoint the
+The daemon owns the SQLite store, a polled model of the VM, and the loopback endpoint the
 agent talks to. It is a long-lived user service — a systemd user unit on Linux, a launchd
 agent on macOS, both installed by the flake's home-manager module — and `daemon start`
 falls back to a plain background process when neither is present, so `nix run` still
@@ -328,9 +331,11 @@ answer it. `login` writes both files once and never overwrites them, so an edit 
 
 ## Configuration
 
-Copy [`config.example`](config.example) to `~/.config/capsule/config`. It is
-sourced as a shell script; anything set there overrides the defaults. Common
-knobs:
+Copy [`config.example`](config.example) to `~/.config/capsule/config`. It is `KEY=value`,
+with `#` comments and `$VAR` / `${VAR:-default}` expansion — the subset of shell the file
+was always written in, now parsed rather than sourced. **The daemon reads it too**, which
+it could not when the file was sourced by a shell the daemon never ran. A line the parser
+cannot use is reported on stderr rather than dropped. Common knobs:
 
 | variable | default | meaning |
 |---|---|---|
@@ -338,7 +343,7 @@ knobs:
 | `CAPSULE_VM_PORT` | `2222` | ssh port |
 | `CAPSULE_IMAGE` | `ghcr.io/stevio89/capsule:latest` | container image |
 | `CAPSULE_MAIN_BRANCH` | auto-detected | branch whose merge re-syncs the replica |
-| `CAPSULE_MCP_PORT` | `8765` | loopback port the agent reaches `capsuled` on |
+| `CAPSULE_MCP_PORT` | `8765` | loopback port the agent reaches the daemon on |
 | `CAPSULE_POLL_INTERVAL` | `3` | seconds between world-model refreshes |
 | `CAPSULE_VM_CPUS` / `CAPSULE_VM_MEM` | `4` / `6144` | VM resources |
 | `CAPSULE_DISK_SIZE` | `80G` | VM disk size |
@@ -353,19 +358,28 @@ re-locks nixpkgs and ships current agent CLIs — build it yourself with
 
 ## Tests
 
-Framework-free bash for the shell side, and Zig's own runner for `capsuled` — no VM, no
+Zig's own runner, plus one bash suite for the daemon's socket and HTTP surface — no VM, no
 network, nothing to install beyond the devshell:
 
 ```sh
-bash test/capsule-test.sh     # flake rewriting, the command taxonomy, the gating rules
 nix develop --command zig build test
 nix develop --command sh -c 'zig build && bash test/capsuled-test.sh'   # socket + HTTP
 ```
 
-The daemon's interesting logic is kept in pure functions so it can be tested without a
-socket, a database, or a terminal: event replay, the triage/memory buffer parser, prefix
-resolution, the world-model probe parser, and the HTTP head parser. The ssh tunnel is not
-covered and is deliberately not mocked — a mocked ssh would only prove the mock.
+The interesting logic is kept in pure functions so it can be tested without a socket, a
+database, or a terminal: event replay, the triage/memory buffer parser, prefix resolution,
+the world-model probe parser, the HTTP head parser, and the flake rewriting.
+
+Three things are checked by handing them to a real shell, because nothing else can answer
+them. The container command is run past a fake `podman` that echoes its argv, proving it
+survives exactly one shell parse — split it a second time and the agent gets an unnamed
+tmux session with its instructions scattered across arguments. The generated remote scripts
+are put through `sh -n`, and their paths through actual expansion, because
+`"$HOME/capsule/'name'"` parses perfectly and resolves to the wrong directory.
+
+The ssh tunnel is not covered and is deliberately not mocked — a mocked ssh would only
+prove the mock. Tests that need a git repository skip where there is none, so the flake's
+`checkPhase` passes in a sandbox that unpacks the source without one.
 
 ## License
 
