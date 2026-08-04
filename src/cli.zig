@@ -135,7 +135,7 @@ pub const commands = [_]Command{
     .{ .group = "daemon", .verb = "stop", .summary = "stop it", .needs = .{ .host = true }, .ported = true },
     .{ .group = "daemon", .verb = "status", .summary = "whether it is up, and what it is holding", .needs = .{ .host = true }, .ported = true },
 
-    .{ .group = "board", .summary = "VM, issues, memory and waiting branches — read-only", .needs = .{ .host = true, .daemon = true } },
+    .{ .group = "board", .summary = "VM, issues, memory and waiting branches — read-only", .needs = .{ .host = true, .daemon = true }, .ported = true },
     .{ .group = "login", .args = "[profile]", .summary = "a container to authenticate the agent CLI in", .needs = .{ .host = true, .vm = true }, .ported = true },
 };
 

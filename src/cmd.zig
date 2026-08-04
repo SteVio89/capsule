@@ -2938,11 +2938,27 @@ test "vm ssh hands its arguments to the remote shell, as plain ssh does" {
     );
 }
 
+/// Ported, but dispatched by `main.zig` before the command table is consulted.
+///
+/// `board` takes the terminal into raw mode on the alternate screen and needs the
+/// general-purpose allocator for its frame buffers — neither of which `Ctx` carries, since
+/// every other command is a short-lived request/response. It is intercepted alongside
+/// `daemon` and `seed` rather than routed through a handler.
+const dispatched_early = [_][2][]const u8{
+    .{ "board", "" },
+};
+
 test "a command marked ported has a handler, and one that is not says so" {
     // The dispatcher's fallthrough exists so a table edit that forgets a handler is a
     // clear message rather than a silent success.
     for (&cli.commands) |*c| {
         if (!c.ported) continue;
+        var early = false;
+        for (dispatched_early) |e| {
+            if (std.mem.eql(u8, c.group, e[0]) and std.mem.eql(u8, c.verb, e[1])) early = true;
+        }
+        if (early) continue;
+
         var known = false;
         for (handled) |h| {
             if (std.mem.eql(u8, c.group, h[0]) and std.mem.eql(u8, c.verb, h[1])) known = true;

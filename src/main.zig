@@ -183,7 +183,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, command, "board")) {
-        const project_params = take(rest, &taken) orelse "";
+        // Resolved here rather than taken from argv: bash used to compute this and pass it
+        // in, so a `capsule board` run without it showed a dashboard with no project on
+        // it. An explicit argument still wins, because the integration tests pass one.
+        const project_params = take(rest, &taken) orelse boardParams(arena, init.io) orelse "";
         capsule.board.run(arena, init.gpa, init.io, paths.socket, project_params) catch |e| switch (e) {
             error.DaemonNotRunning => {
                 try err.interface.writeAll("capsule is not running — run 'capsule daemon start'\n");
@@ -304,6 +307,22 @@ fn rawCall(
 /// in a file that worked yesterday should cost one setting, not the whole tool. A value
 /// that would change the meaning of a remote command line is the exception — that is
 /// refused, exactly as the shell version refused a `CAPSULE_VM_HOST` without an `@`.
+/// The board's project context, encoded from the working directory.
+///
+/// Null outside a repository, which is a perfectly normal way to open the board: it then
+/// shows the VM and nothing project-shaped, rather than refusing to start.
+fn boardParams(arena: std.mem.Allocator, io: std.Io) ?[]const u8 {
+    const repo = capsule.git.discover(arena, io) catch return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    var w = std.Io.Writer.Allocating.fromArrayList(arena, &out);
+    std.json.Stringify.value(.{
+        .git_common_dir = repo.git_common_dir,
+        .cwd = repo.cwd,
+    }, capsule.api.stringify_options, &w.writer) catch return null;
+    return w.written();
+}
+
 fn loadSettings(
     arena: std.mem.Allocator,
     init: std.process.Init,

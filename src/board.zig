@@ -23,8 +23,8 @@ pub fn run(
     io: Io,
     socket_path: []const u8,
     /// Pre-encoded `{"git_common_dir":…,"cwd":…}`, or empty when the board was opened
-    /// outside a repository. bash resolves this — it has `pwd -P`, and 0.16's stdlib has
-    /// no realpath.
+    /// outside a repository. `main.zig` resolves it through `git.discover`; it used to be
+    /// bash's job, on the since-corrected belief that 0.16 had no realpath.
     project_params: []const u8,
 ) !void {
     _ = client.call(arena, io, socket_path, "ping", "{}") catch return error.DaemonNotRunning;

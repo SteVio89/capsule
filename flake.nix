@@ -37,50 +37,35 @@
         {
           default = self.packages.${system}.capsule;
 
-          capsuled = pkgs.stdenv.mkDerivation {
-            pname = "capsuled";
-            version = "0.1.0";
-            src = ./.;
-
-            nativeBuildInputs = [ pkgs.zig_0_16 ];
-            zigBuildFlags = [ "--system" "${zigDeps}" ];
-            zigCheckFlags = [ "--system" "${zigDeps}" ];
-            doCheck = true;
-
-            meta = {
-              description = "capsule's host daemon, MCP endpoint, and dashboard";
-              mainProgram = "capsuled";
-              platforms = systems;
-            };
-          };
-
-          capsule = pkgs.stdenvNoCC.mkDerivation {
+          # One binary. `capsule daemon` is the service; there is no separate `capsuled`
+          # and no shell wrapper. Two packages both installing `bin/capsule` is what the
+          # rename of the Zig artifact turned into a buildEnv collision.
+          capsule = pkgs.stdenv.mkDerivation {
             pname = "capsule";
             version = "0.1.0";
             src = ./.;
 
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            nativeBuildInputs = [ pkgs.zig_0_16 pkgs.makeWrapper ];
+            zigBuildFlags = [ "--system" "${zigDeps}" ];
+            zigCheckFlags = [ "--system" "${zigDeps}" ];
+            doCheck = true;
 
-            installPhase = ''
-              runHook preInstall
-              # `capsule image` ships this tree to the VM as the podman build context,
-              # so the repo layout has to survive packaging.
+            postInstall = ''
+              # `capsule image build` ships this tree to the VM as the podman build
+              # context, so the repo layout has to survive packaging.
               mkdir -p $out/libexec/capsule
               cp -r bin container share $out/libexec/capsule/
-              install -Dm755 bin/capsule $out/bin/capsule
               wrapProgram $out/bin/capsule \
                 --set-default CAPSULE_SRC $out/libexec/capsule \
-                --set-default CAPSULE_SHARE $out/libexec/capsule/share \
                 --prefix PATH : ${
                   pkgs.lib.makeBinPath (
                     with pkgs;
-                    # fzf and tuicr are hard dependencies: the id pickers and `run review`.
-                    [ git curl jq fzf tuicr coreutils gnused gawk gnutar gzip findutils ]
-                    ++ [ self.packages.${system}.capsuled ]
+                    # No jq, fzf, awk or sed: the JSON is typed, the picker is native, and
+                    # the flake rewriting is Zig. tuicr stays — `run review` spawns it.
+                    [ git openssh curl gnutar gzip tuicr ]
                     ++ lib.optionals stdenv.isDarwin [ qemu butane xz ]
                   )
                 }
-              runHook postInstall
             '';
 
             meta = {
@@ -89,6 +74,10 @@
               platforms = systems;
             };
           };
+
+          # Kept so a configuration that still names `capsuled` evaluates. It is the same
+          # derivation, so buildEnv sees one store path rather than a conflict.
+          capsuled = self.packages.${system}.capsule;
         }
       );
 
@@ -96,17 +85,17 @@
         { pkgs, lib, ... }:
         let
           system = pkgs.stdenv.hostPlatform.system;
-          capsuled = self.packages.${system}.capsuled;
+          capsule = self.packages.${system}.capsule;
         in
         {
-          home.packages = [ self.packages.${system}.capsule capsuled ];
+          home.packages = [ capsule ];
 
           # A long-lived user service: the daemon outlives `vm destroy` and holds the ssh
           # master and reverse tunnel. `capsule daemon start` drives whichever is present.
           systemd.user.services.capsuled = lib.mkIf pkgs.stdenv.isLinux {
             Unit.Description = "capsule host daemon";
             Service = {
-              ExecStart = lib.getExe capsuled + " daemon";
+              ExecStart = lib.getExe capsule + " daemon";
               Restart = "on-failure";
               RestartSec = 2;
             };
@@ -117,7 +106,7 @@
             enable = true;
             config = {
               Label = "dev.capsule.capsuled";
-              ProgramArguments = [ (lib.getExe capsuled) "daemon" ];
+              ProgramArguments = [ (lib.getExe capsule) "daemon" ];
               KeepAlive = true;
               RunAtLoad = true;
             };
