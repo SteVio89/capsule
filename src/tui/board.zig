@@ -34,6 +34,10 @@ pub const Project = struct {
 /// and is threaded through, leaving `render` pure and the selection stable.
 pub const State = struct {
     issues: list_mod.List = .{},
+    /// Whether the event log for the selected issue is open. The board otherwise reports
+    /// that an issue is blocked without ever saying who blocked it or why — the log has
+    /// been written since the first commit and read by nothing.
+    detail: bool = false,
 
     /// Re-applies the list's invariants against however many issues this frame brought.
     /// Called before rendering because the count changes underneath the cursor whenever
@@ -105,8 +109,96 @@ pub fn render(
     y += 1;
     y = renderBranches(&s, snapshot, project, y);
 
-    if (h >= 2) s.write(0, h - 1, "q quit   r refresh   ↑↓ select", .{ .fg = .dim });
+    // The keys that act come after the keys that look, and every one of them names a
+    // command you could have typed. The board is a faster way to reach the CLI, not a
+    // second place where things happen.
+    if (h >= 2) {
+        s.write(0, h - 1, "q quit  ↑↓ select  ↵ log  n new  s start  t triage  M memory", .{ .fg = .dim });
+    }
     return s;
+}
+
+/// One issue and its event log, filling the screen.
+///
+/// Full-screen rather than a split pane: on the 80x24 this is used at, a split leaves both
+/// halves too narrow to read, and the log is what you came for once you have chosen a row.
+pub fn renderDetail(
+    gpa: std.mem.Allocator,
+    issue: api.BoardIssue,
+    events: []const api.Event,
+    now_ms: i64,
+    w: usize,
+    h: usize,
+) !Screen {
+    var s = try Screen.init(gpa, w, h);
+    errdefer s.deinit(gpa);
+
+    var y: usize = 0;
+    s.write(0, y, issue.short, .{ .bold = true });
+    s.write(10, y, stateLabel(issue.state), .{ .fg = stateColour(issue.state) });
+    y += 1;
+    if (y < h) {
+        s.write(0, y, truncate(issue.title, w).text, .{});
+        y += 2;
+    }
+
+    if (y < h) {
+        s.write(0, y, "log", .{ .bold = true });
+        y += 1;
+    }
+    if (events.len == 0) {
+        if (y < h) s.write(2, y, "no events", .{ .fg = .dim });
+        return s;
+    }
+
+    // Oldest first, and the tail is what matters, so a log longer than the screen drops
+    // its beginning rather than its end.
+    const start = if (events.len > h -| y) events.len - (h -| y) else 0;
+    for (events[start..]) |event| {
+        if (y >= h) break;
+        renderEventRow(&s, event, now_ms, y);
+        y += 1;
+    }
+    return s;
+}
+
+fn renderEventRow(s: *Screen, event: api.Event, now_ms: i64, y: usize) void {
+    var age_buf: [24]u8 = undefined;
+    const age = relativeAge(&age_buf, now_ms - event.created_at);
+    s.write(0, y, age, .{ .fg = .dim });
+
+    // The actor is the fact a reader cannot reconstruct: the same kind of event means
+    // something different when an agent wrote it inside a run than when you typed it.
+    const actor: []const u8 = switch (event.actor) {
+        .human => "you",
+        .agent => "agent",
+    };
+    s.write(8, y, actor, .{ .fg = if (event.actor == .agent) .cyan else .default });
+
+    s.write(16, y, @tagName(event.kind), .{});
+
+    if (event.payload.len > 0 and s.w > 34) {
+        const text = truncate(firstLine(event.payload), s.w - 34);
+        s.write(34, y, text.text, .{ .fg = .dim });
+        if (text.cut) s.write(34 + screen.displayWidth(text.text), y, "…", .{ .fg = .dim });
+    }
+}
+
+/// The first line of a payload. A comment is free text and its later lines would overwrite
+/// whatever the renderer drew next.
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
+}
+
+/// A coarse "how long ago", written into `buf`. Coarse on purpose: the log is read to
+/// understand a sequence, and a wall-clock timestamp makes that arithmetic the reader's job.
+fn relativeAge(buf: []u8, delta_ms: i64) []const u8 {
+    const s = @max(0, @divTrunc(delta_ms, 1000));
+    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s}) catch "?";
+    if (s < 3600) return std.fmt.bufPrint(buf, "{d}m", .{@divTrunc(s, 60)}) catch "?";
+    if (s < 86400) return std.fmt.bufPrint(buf, "{d}h", .{@divTrunc(s, 3600)}) catch "?";
+    return std.fmt.bufPrint(buf, "{d}d", .{@divTrunc(s, 86400)}) catch "?";
 }
 
 /// How many issue rows the list gets on a terminal `h` rows tall.
@@ -605,6 +697,62 @@ test "a viewport smaller than the backlog says how much it is hiding" {
     try testing.expect((try findRow(s, "2 more below")) != null);
 }
 
+const sample_events = [_]api.Event{
+    .{ .id = "e1", .kind = .created, .actor = .human, .payload = "", .created_at = 0, .run = null },
+    .{ .id = "e2", .kind = .commented, .actor = .agent, .payload = "found the cause\nsecond line", .created_at = 60_000, .run = "019fb1ce" },
+    .{ .id = "e3", .kind = .state_changed, .actor = .agent, .payload = "needs a decision", .created_at = 120_000, .run = "019fb1ce" },
+};
+
+test "the log names who acted, not only what happened" {
+    var s = try renderDetail(testing.allocator, sample_issues[0], &sample_events, 180_000, 80, 24);
+    defer s.deinit(testing.allocator);
+
+    // The board could always say an issue was blocked. It could never say by whom.
+    try testing.expect((try findRow(s, "3f2a1b9c")) != null);
+    try testing.expect((try findRow(s, "make the board useful")) != null);
+    const blocked = (try findRow(s, "state_changed")).?;
+    const text = try s.rowText(testing.allocator, blocked);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "agent") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "needs a decision") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "1m") != null);
+}
+
+test "a multi-line payload cannot overwrite the row beneath it" {
+    var s = try renderDetail(testing.allocator, sample_issues[0], &sample_events, 180_000, 80, 24);
+    defer s.deinit(testing.allocator);
+
+    try testing.expect((try findRow(s, "found the cause")) != null);
+    try testing.expect((try findRow(s, "second line")) == null);
+}
+
+test "a log longer than the screen keeps its end, not its beginning" {
+    var many: [40]api.Event = undefined;
+    for (&many, 0..) |*e, i| {
+        e.* = .{
+            .id = "x",
+            .kind = if (i == 39) .merged else .commented,
+            .actor = .human,
+            .payload = if (i == 0) "the very first" else "later",
+            .created_at = @intCast(i),
+            .run = null,
+        };
+    }
+
+    var s = try renderDetail(testing.allocator, sample_issues[0], &many, 1000, 80, 24);
+    defer s.deinit(testing.allocator);
+
+    // What just happened is why you opened the log; what happened first is history.
+    try testing.expect((try findRow(s, "merged")) != null);
+    try testing.expect((try findRow(s, "the very first")) == null);
+}
+
+test "an issue with no events says so rather than drawing an empty pane" {
+    var s = try renderDetail(testing.allocator, sample_issues[0], &.{}, 1000, 80, 24);
+    defer s.deinit(testing.allocator);
+    try testing.expect((try findRow(s, "no events")) != null);
+}
+
 test "a title too wide for its column is cut with an ellipsis" {
     const long = [_]api.BoardIssue{.{
         .short = "aaaaaaaa",
@@ -698,7 +846,9 @@ test "another project's waiting branches do not contradict this project's claims
 test "without a project the board still renders the VM alone" {
     var s = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, null, &.{}, .{}, 1, 80, 24);
     defer s.deinit(testing.allocator);
-    try testing.expect((try findRow(s, "issues")) == null);
-    try testing.expect((try findRow(s, "memory")) == null);
+    // By panel content, not by heading: the footer names every action key, so "memory"
+    // and "issues" both appear there whatever the panels above do.
+    try testing.expect((try findRow(s, "capsule issue new")) == null);
+    try testing.expect((try findRow(s, "/40 active")) == null);
     try testing.expect((try findRow(s, "state")) != null);
 }

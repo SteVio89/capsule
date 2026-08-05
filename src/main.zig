@@ -187,7 +187,7 @@ pub fn main(init: std.process.Init) !u8 {
         // in, so a `capsule board` run without it showed a dashboard with no project on
         // it. An explicit argument still wins, because the integration tests pass one.
         const project_params = take(rest, &taken) orelse boardParams(arena, init.io) orelse "";
-        capsule.board.run(arena, init.gpa, init.io, paths.socket, project_params) catch |e| switch (e) {
+        capsule.board.run(arena, init.gpa, init.io, paths.socket, project_params, exe_path) catch |e| switch (e) {
             error.DaemonNotRunning => {
                 try err.interface.writeAll("capsule is not running — run 'capsule daemon start'\n");
                 return 1;

@@ -5,6 +5,7 @@ const Io = std.Io;
 
 const api = @import("api.zig");
 const client = @import("client.zig");
+const exec = @import("exec.zig");
 const world = @import("world.zig");
 const term = @import("tui/term.zig");
 const board_render = @import("tui/board.zig");
@@ -27,6 +28,11 @@ pub fn run(
     /// outside a repository. `main.zig` resolves it through `git.discover`; it used to be
     /// bash's job, on the since-corrected belief that 0.16 had no realpath.
     project_params: []const u8,
+    /// capsule's own binary as it was invoked, which the action keys re-run. Passed rather
+    /// than looked up: 0.16 has no `selfExePath`, and argv[0] is the better answer anyway —
+    /// a bare `capsule` re-resolves through `PATH` the way the shell did, while
+    /// `./zig-out/bin/capsule` keeps acting on the build you are testing.
+    exe_path: []const u8,
 ) !void {
     _ = client.call(arena, io, socket_path, "ping", "{}") catch return error.DaemonNotRunning;
 
@@ -52,14 +58,22 @@ pub fn run(
 
         const size = t.size();
         state.sync(view.issues.len, board_render.listHeight(view.project != null, size.h));
+        const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
 
-        var current = try board_render.render(
+        const selected = state.selected(view.issues);
+        if (selected == null) state.detail = false;
+
+        var current = if (state.detail and selected != null) detail: {
+            const issue = selected.?;
+            const events = fetchEvents(frame.allocator(), io, socket_path, project_params, issue.short);
+            break :detail try board_render.renderDetail(gpa, issue, events, now_ms, size.w, size.h);
+        } else try board_render.render(
             gpa,
             view.snapshot,
             view.project,
             view.issues,
             state,
-            Io.Timestamp.now(io, .real).toMilliseconds(),
+            now_ms,
             size.w,
             size.h,
         );
@@ -69,13 +83,75 @@ pub fn run(
         if (previous) |*p| p.deinit(gpa);
         previous = current;
 
+        // An action hands the screen to another program, so the next paint cannot diff
+        // against what the dashboard last drew — that memory is stale the moment `capsule
+        // issue new` writes a line of its own.
+        var acted = false;
+        defer if (acted) {
+            if (previous) |*p| p.deinit(gpa);
+            previous = null;
+        };
+
         var waited: usize = 0;
         while (waited < refresh_ms / 100) : (waited += 1) {
             const key = t.readKey();
+
+            // The detail view claims its keys first, and claims very few: while it is open
+            // `q` closes it rather than quitting capsule. Anything that walks the list
+            // underneath would move a selection the reader cannot see.
+            if (state.detail) {
+                switch (key) {
+                    .escape => {
+                        state.detail = false;
+                        break;
+                    },
+                    .key => |b| switch (b) {
+                        'q', 27 => {
+                            state.detail = false;
+                            break;
+                        },
+                        3 => return,
+                        else => {},
+                    },
+                    .closed => return,
+                    else => {},
+                }
+                continue;
+            }
+
             switch (key) {
                 .key => |b| switch (b) {
                     'q', 3 => return,
                     'r' => break,
+                    '\r', '\n' => {
+                        state.detail = true;
+                        break;
+                    },
+                    'n' => {
+                        newIssue(&t, io, frame.allocator(), exe_path);
+                        acted = true;
+                        break;
+                    },
+                    // Dispatches the row under the cursor, which is the whole reason the
+                    // list is selectable — `run start` otherwise opens a picker to ask
+                    // what the board is already showing.
+                    's' => {
+                        if (selected) |issue| {
+                            shellOut(&t, io, &.{ exe_path, "run", "start", issue.short });
+                            acted = true;
+                            break;
+                        }
+                    },
+                    't' => {
+                        shellOut(&t, io, &.{ exe_path, "issue", "triage" });
+                        acted = true;
+                        break;
+                    },
+                    'M' => {
+                        shellOut(&t, io, &.{ exe_path, "memory", "review" });
+                        acted = true;
+                        break;
+                    },
                     else => {},
                 },
                 .closed => return,
@@ -122,6 +198,89 @@ fn fetch(
         return .{};
     if (!response.ok) return .{};
     return parseFrame(arena, response.body);
+}
+
+/// Hands the terminal back, runs a capsule command on it, then restores the dashboard.
+///
+/// The board acts by invoking the CLI it ships beside, rather than reimplementing anything
+/// against the daemon. `run start` alone is two batched ssh scripts, a seed tarball and a
+/// git push — none of which the daemon can do — and `issue new` wants `$EDITOR`. One
+/// implementation of every action, already exercised against a real VM.
+///
+/// Failures are swallowed on purpose: the command printed its own complaint on the
+/// terminal it was handed, and the dashboard's job is to come back either way.
+fn shellOut(t: *term.Term, io: Io, argv: []const []const u8) void {
+    t.leaveRaw();
+    defer t.enterRaw() catch {};
+    _ = exec.interactive(io, argv, .{}) catch {};
+}
+
+/// `n` — asks for a title on the plain terminal, then hands over to `issue new`, which
+/// opens the body in `$EDITOR`.
+///
+/// One `leaveRaw`/`enterRaw` around both the prompt and the command: doing it separately
+/// flickers the alternate screen in and out between typing the title and the editor
+/// appearing, which reads as a glitch rather than a step.
+fn newIssue(t: *term.Term, io: Io, arena: std.mem.Allocator, exe_path: []const u8) void {
+    t.leaveRaw();
+    defer t.enterRaw() catch {};
+
+    const title = askLine(arena, io, "title (empty to cancel): ") orelse return;
+    const argv: []const []const u8 = &.{ exe_path, "issue", "new", title };
+    _ = exec.interactive(io, argv, .{}) catch {};
+}
+
+/// Asks for one line on the restored terminal. Null when the reader cancelled with an
+/// empty line, which is the only way out of a prompt that has already taken the screen.
+fn askLine(arena: std.mem.Allocator, io: Io, question: []const u8) ?[]const u8 {
+    const tty = Io.Dir.cwd().openFile(io, "/dev/tty", .{ .mode = .read_write }) catch return null;
+    defer tty.close(io);
+
+    var out: [256]u8 = undefined;
+    var writer = tty.writer(io, &out);
+    writer.interface.writeAll(question) catch return null;
+    writer.interface.flush() catch return null;
+
+    var buf: [4096]u8 = undefined;
+    var reader = tty.readerStreaming(io, &buf);
+    const line = reader.interface.takeDelimiterExclusive('\n') catch return null;
+
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return null;
+    return arena.dupe(u8, trimmed) catch null;
+}
+
+/// The selected issue's event log, or empty on any failure.
+///
+/// Fetched only while the detail view is open, rather than for every issue on every tick:
+/// the log is unbounded and the board polls once a second.
+fn fetchEvents(
+    arena: std.mem.Allocator,
+    io: Io,
+    socket_path: []const u8,
+    project_params: []const u8,
+    short: []const u8,
+) []const api.Event {
+    const params = withId(arena, project_params, short) orelse return &.{};
+    const response = client.call(arena, io, socket_path, api.issue_events.name, params) catch
+        return &.{};
+    if (!response.ok) return &.{};
+    return api.parseResult(api.issue_events, arena, response.body) catch &.{};
+}
+
+/// `{"git_common_dir":…,"cwd":…}` with an `"id"` added.
+///
+/// Spliced rather than re-encoded because `run` is handed the repo fields already encoded
+/// and never sees them apart. The input is capsule's own output, so its last byte is the
+/// closing brace; anything else returns null rather than producing malformed JSON. `short`
+/// is a hex id from the daemon, so it needs no escaping.
+fn withId(arena: std.mem.Allocator, project_params: []const u8, short: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, project_params, " \t\r\n");
+    if (!std.mem.endsWith(u8, trimmed, "}") or trimmed.len < 2) return null;
+    for (short) |c| {
+        if (!std.ascii.isHex(c)) return null;
+    }
+    return std.fmt.allocPrint(arena, "{s},\"id\":\"{s}\"}}", .{ trimmed[0 .. trimmed.len - 1], short }) catch null;
 }
 
 /// Pure: the daemon's JSON in, the renderer's shapes out. Separated from the socket so
@@ -270,6 +429,29 @@ test "an unknown state in the issue list is refused, not rendered as `open`" {
         \\ "run":null,"commits":null}],"runs":[]}
     );
     try testing.expect(!f.snapshot.reachable);
+}
+
+test "the events request carries the repo fields plus the id" {
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const params = withId(arena, "{\"git_common_dir\":\"/p/.git\",\"cwd\":\"/p\"}", "3f2a1b9c").?;
+    try testing.expectEqualStrings(
+        "{\"git_common_dir\":\"/p/.git\",\"cwd\":\"/p\",\"id\":\"3f2a1b9c\"}",
+        params,
+    );
+
+    // It parses as the daemon's own parameter type, which is the only check that matters.
+    const parsed = try std.json.parseFromSlice(api.IdParams, testing.allocator, params, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("3f2a1b9c", parsed.value.id);
+
+    // Splicing into something that is not an object would produce malformed JSON, and an
+    // id that is not hex could carry a quote into it. Both refuse rather than build it.
+    try testing.expectEqual(@as(?[]const u8, null), withId(arena, "", "3f2a1b9c"));
+    try testing.expectEqual(@as(?[]const u8, null), withId(arena, "not json", "3f2a1b9c"));
+    try testing.expectEqual(@as(?[]const u8, null), withId(arena, "{}", "\",\"x\":\""));
 }
 
 test "a frame from the daemon draws without a terminal" {
