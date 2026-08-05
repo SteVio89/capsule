@@ -123,16 +123,25 @@ pub fn startTunnel(arena: std.mem.Allocator, io: std.Io, cfg: Config) !std.proce
 /// the reason every value interpolated into one goes through `shellQuote` first.
 pub fn execArgs(arena: std.mem.Allocator, cfg: Config, remote: []const u8) ![]const []const u8 {
     var args = try baseArgs(arena, cfg);
-    try args.appendSlice(arena, &.{ cfg.vm_host, remote });
+    try args.append(arena, cfg.vm_host);
+    if (remote.len > 0) try args.append(arena, remote);
     return args.toOwnedSlice(arena);
 }
 
 /// The same with `-t`, which allocates a remote tty. Needed by anything that draws:
 /// a login shell, `podman exec -it`, an editor on the VM.
+/// An empty `remote` means "no command" — a login shell — and the argument is omitted
+/// rather than passed as `""`.
+///
+/// This is not a nicety. `ssh host ""` is ssh being *given* a command to run, which the
+/// remote shell executes as nothing and exits from immediately, so `capsule vm ssh` opened
+/// a session and closed it in the same breath. bash omitted the argument when it had none;
+/// passing an empty string was the port's invention.
 pub fn execTtyArgs(arena: std.mem.Allocator, cfg: Config, remote: []const u8) ![]const []const u8 {
     var args = try baseArgs(arena, cfg);
     try args.append(arena, "-t");
-    try args.appendSlice(arena, &.{ cfg.vm_host, remote });
+    try args.append(arena, cfg.vm_host);
+    if (remote.len > 0) try args.append(arena, remote);
     return args.toOwnedSlice(arena);
 }
 
@@ -426,6 +435,25 @@ test "the remote command is one argument, so the remote shell parses it once" {
     const argv = try execArgs(a.allocator(), test_cfg, remote);
     try testing.expectEqualStrings(remote, argv[argv.len - 1]);
     try testing.expectEqualStrings(test_cfg.vm_host, argv[argv.len - 2]);
+}
+
+test "no remote command means no argument, not an empty one" {
+    var a = testArena();
+    defer a.deinit();
+    const arena = a.allocator();
+
+    // `ssh host ""` hands ssh a command to run. The remote shell runs nothing and exits,
+    // so `capsule vm ssh` opened a login shell and closed it in the same breath.
+    const tty = try execTtyArgs(arena, test_cfg, "");
+    try testing.expectEqualStrings(test_cfg.vm_host, tty[tty.len - 1]);
+
+    const plain = try execArgs(arena, test_cfg, "");
+    try testing.expectEqualStrings(test_cfg.vm_host, plain[plain.len - 1]);
+
+    // With a command it is the last word, and the host is the one before it.
+    const with = try execTtyArgs(arena, test_cfg, "uptime -p");
+    try testing.expectEqualStrings("uptime -p", with[with.len - 1]);
+    try testing.expectEqualStrings(test_cfg.vm_host, with[with.len - 2]);
 }
 
 test "only the interactive form asks for a remote tty" {
