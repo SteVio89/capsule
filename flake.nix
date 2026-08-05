@@ -84,7 +84,13 @@
                     with pkgs;
                     # No jq, fzf, awk or sed: the JSON is typed, the picker is native, and
                     # the flake rewriting is Zig. tuicr stays — `run review` spawns it.
-                    [ git openssh curl gnutar gzip tuicr ]
+                    #
+                    # Deliberately no openssh. The user's ssh is the right one: on darwin
+                    # `UseKeychain` is an Apple extension that upstream OpenSSH refuses
+                    # outright, so shadowing /usr/bin/ssh breaks every command that reaches
+                    # the VM for anyone whose ~/.ssh/config uses it. capsule passes its own
+                    # options explicitly and needs nothing a system ssh lacks.
+                    [ git curl gnutar gzip tuicr ]
                     ++ lib.optionals stdenv.isDarwin [ qemu butane xz ]
                   )
                 }
