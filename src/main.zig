@@ -30,10 +30,6 @@ pub fn main(init: std.process.Init) !u8 {
     const exe_path = it.next() orelse "capsule";
     while (it.next()) |a| try argv.append(arena, a);
 
-    // A bare `capsule` opens the board. That is what makes it the daily driver, and it is
-    // what `capsule help` exists for otherwise. Not down a pipe, though: a redirected or
-    // scripted `capsule` gets the listing, since a dashboard is no use to it and the board
-    // pings the daemon before it ever notices there is no terminal.
     const command = if (argv.items.len > 0)
         argv.items[0]
     else if (std.Io.File.stdout().isTty(init.io) catch false)
