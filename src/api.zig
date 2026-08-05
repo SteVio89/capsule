@@ -66,6 +66,28 @@ pub const Issue = struct {
     /// Null on an issue with no events yet. Always present as a key — the CLI uses it as
     /// an optimistic-concurrency token and must be able to tell absent from unset.
     last_event_id: ?[]const u8,
+    /// Milliseconds. Last in declaration order on purpose: appending leaves every byte
+    /// before it where an existing reader already found it.
+    created_at: i64,
+};
+
+/// One entry in an issue's history.
+///
+/// The append-only log has been written since the beginning and read by nothing. This is
+/// what makes it visible: not just that a state changed, but who changed it and what they
+/// said while doing so.
+pub const Event = struct {
+    id: []const u8,
+    /// The enums, not strings — same reason as `Issue.state`: one vocabulary, checked by
+    /// the compiler on both sides of the wire.
+    kind: model.Event.Kind,
+    actor: model.Event.Actor,
+    /// Whatever the kind carries: a comment's text, an archive reason, a commit message.
+    payload: []const u8,
+    created_at: i64,
+    /// The run this happened inside, or null when it was typed on the host. This is how a
+    /// reader tells the agent's own note from yours.
+    run: ?[]const u8,
 };
 
 pub const Run = struct {
@@ -116,6 +138,40 @@ pub const Summary = struct {
     memory: MemoryStats,
 };
 
+/// One issue as the board lists it.
+///
+/// `body` is deliberately absent. The board polls once a second, and shipping every
+/// issue's full text on every tick to draw a one-line row costs more than it buys; the
+/// detail pane fetches `issue.get` for the row under the cursor instead.
+pub const BoardIssue = struct {
+    short: []const u8,
+    state: model.Issue.State,
+    title: []const u8,
+    created_at: i64,
+    /// The live run's short id, or null. Without it `in_progress` means both "an agent is
+    /// working on this" and "an agent stopped halfway and nobody noticed".
+    run: ?[]const u8,
+    /// Commits on this issue's branch that the working branch does not have, joined from
+    /// the VM probe. Null when the VM is unreachable — not the same as zero, and a board
+    /// that draws them alike reports work that may not exist as definitely absent.
+    commits: ?u64,
+};
+
+/// Everything one frame of the dashboard needs, in one call under one lock.
+///
+/// The board used to make two calls a second and would need 2+N once it listed projects.
+/// Worse, the two arrived at different instants: the VM panel could show a container the
+/// issue panel had no run for. One call is also one consistent moment.
+pub const Board = struct {
+    world: World,
+    projects: []const Project,
+    /// Null when `capsule board` was run outside a registered project, which is a normal
+    /// state — the VM panel still has something to say.
+    project: ?Summary,
+    issues: []const BoardIssue,
+    runs: []const Run,
+};
+
 pub const Memory = struct {
     short: []const u8,
     state: model.Memory.State,
@@ -150,15 +206,15 @@ pub const Branch = struct {
     commits: u64,
 };
 
-/// Deliberately without `image_digest`: the probe collects it and `writeSnapshot` has
-/// never serialised it. Adding it here would change the wire, which belongs in the board
-/// work rather than in a protocol port.
 pub const World = struct {
     reachable: bool,
     observed_at_ms: i64,
     uptime_s: ?u64,
     disk_used: ?u64,
     disk_total: ?u64,
+    /// The probe has collected this since the beginning and no writer ever emitted it.
+    /// Without it "the VM is running an older image than the one you built" is invisible.
+    image_digest: ?[]const u8,
     containers: []const Container,
     branches: []const Branch,
 };
@@ -202,6 +258,13 @@ pub const Stopping = struct { stopping: bool };
 // ---------------------------------------------------------------------------
 
 pub const NoParams = struct {};
+
+/// Both default to empty because `board.get` is the one method that must answer outside a
+/// repository: unregistered is a state it renders, not an error it refuses with.
+pub const BoardParams = struct {
+    git_common_dir: []const u8 = "",
+    cwd: []const u8 = "",
+};
 
 pub const RepoParams = struct {
     git_common_dir: []const u8,
@@ -312,6 +375,7 @@ pub const ping = Method("ping", NoParams, Pong);
 pub const daemon_status = Method("daemon.status", NoParams, DaemonStatus);
 pub const daemon_stop = Method("daemon.stop", NoParams, Stopping);
 pub const world_get = Method("world.get", NoParams, World);
+pub const board_get = Method("board.get", BoardParams, Board);
 
 pub const project_list = Method("project.list", NoParams, []const Project);
 pub const project_add = Method("project.add", ProfileParams, Project);
@@ -323,6 +387,7 @@ pub const issue_new = Method("issue.new", NewIssueParams, Issue);
 pub const issue_list = Method("issue.list", ListIssuesParams, []const Issue);
 pub const issue_summary = Method("issue.summary", RepoParams, Summary);
 pub const issue_get = Method("issue.get", IdParams, Issue);
+pub const issue_events = Method("issue.events", IdParams, []const Event);
 pub const issue_edit = Method("issue.edit", EditIssueParams, Issue);
 pub const issue_rename = Method("issue.rename", EditIssueParams, Issue);
 pub const issue_state = Method("issue.state", StateParams, Issue);
@@ -349,14 +414,15 @@ pub const gc_runs = Method("gc.runs", RepoParams, []const GcRun);
 /// Every method, so a test can assert the set is complete and the router can be built
 /// from data rather than from a chain of `std.mem.startsWith`.
 pub const all = .{
-    ping,               daemon_status,       daemon_stop,  world_get,
-    project_list,       project_add,         project_get,  project_profile,
-    project_rm,         issue_new,           issue_list,   issue_summary,
-    issue_get,          issue_edit,          issue_rename, issue_state,
-    issue_merge,        issue_archive,       issue_reopen, issue_comment,
-    issue_triage_load,  issue_triage_apply,  run_list,     run_start,
-    run_end,            memory_stale,        memory_list,  memory_new,
-    memory_review_load, memory_review_apply, gc_branches,  gc_runs,
+    ping,            daemon_status, daemon_stop,        world_get,
+    board_get,       project_list,  project_add,        project_get,
+    project_profile, project_rm,    issue_new,          issue_list,
+    issue_summary,   issue_get,     issue_events,       issue_edit,
+    issue_rename,    issue_state,   issue_merge,        issue_archive,
+    issue_reopen,    issue_comment, issue_triage_load,  issue_triage_apply,
+    run_list,        run_start,     run_end,            memory_stale,
+    memory_list,     memory_new,    memory_review_load, memory_review_apply,
+    gc_branches,     gc_runs,
 };
 
 // ---------------------------------------------------------------------------
@@ -513,12 +579,14 @@ test "an issue serialises to exactly the bytes the hand-written writer produced"
         .title = "make the board useful",
         .body = "the body",
         .last_event_id = "0192f2a13f2a1b9c0192f2a13f2a1b9d",
+        .created_at = 1735689600000,
     });
     try testing.expectEqualStrings(
         "{\"id\":1,\"ok\":true,\"result\":{\"short\":\"3f2a1b9c\"," ++
             "\"id\":\"0192f2a13f2a1b9c0192f2a13f2a1b9c\",\"state\":\"in_progress\"," ++
             "\"title\":\"make the board useful\",\"body\":\"the body\"," ++
-            "\"last_event_id\":\"0192f2a13f2a1b9c0192f2a13f2a1b9d\"}}\n",
+            "\"last_event_id\":\"0192f2a13f2a1b9c0192f2a13f2a1b9d\"," ++
+            "\"created_at\":1735689600000}}\n",
         got,
     );
 }
@@ -533,8 +601,9 @@ test "a null last_event_id is present as null, never omitted" {
         .title = "t",
         .body = "",
         .last_event_id = null,
+        .created_at = 7,
     });
-    try testing.expect(std.mem.indexOf(u8, got, "\"last_event_id\":null}") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\"last_event_id\":null,") != null);
 }
 
 test "a branch name's slash is not escaped" {
@@ -566,6 +635,7 @@ test "a title carrying quotes, tabs and backslashes round-trips" {
         .title = nasty,
         .body = nasty,
         .last_event_id = null,
+        .created_at = 0,
     });
 
     // Strip the envelope and parse the result back through the typed decoder.
@@ -599,7 +669,7 @@ test "a top-level array result stays an array, and empty stays []" {
     try testing.expectEqualStrings("{\"id\":1,\"ok\":true,\"result\":[]}\n", none);
 }
 
-test "the world model keeps its nulls and omits image_digest" {
+test "an unreachable world keeps its nulls rather than reporting zeros" {
     var a = testArena();
     defer a.deinit();
     const got = try encoded(a.allocator(), World{
@@ -608,16 +678,16 @@ test "the world model keeps its nulls and omits image_digest" {
         .uptime_s = null,
         .disk_used = null,
         .disk_total = null,
+        .image_digest = null,
         .containers = &.{},
         .branches = &.{},
     });
     try testing.expectEqualStrings(
         "{\"id\":1,\"ok\":true,\"result\":{\"reachable\":false,\"observed_at_ms\":0," ++
             "\"uptime_s\":null,\"disk_used\":null,\"disk_total\":null," ++
-            "\"containers\":[],\"branches\":[]}}\n",
+            "\"image_digest\":null,\"containers\":[],\"branches\":[]}}\n",
         got,
     );
-    try testing.expect(std.mem.indexOf(u8, got, "image_digest") == null);
 }
 
 test "the summary's issue counts carry one key per state, in enum order" {
@@ -679,6 +749,134 @@ test "an overridden hint reaches a code that has none of its own" {
     var bw = Writer.Allocating.fromArrayList(a.allocator(), &bare);
     try writeErr(&bw.writer, 1, .refused, "nope", null);
     try testing.expect(std.mem.indexOf(u8, bw.written(), "hint") == null);
+}
+
+test "an event log round-trips, enums and null run included" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const events = [_]Event{
+        .{ .id = "aa", .kind = .created, .actor = .human, .payload = "", .created_at = 1, .run = null },
+        .{ .id = "bb", .kind = .state_changed, .actor = .agent, .payload = "in_progress", .created_at = 2, .run = "3f2a1b9c" },
+        // The payload is free text and has always been allowed to contain anything a
+        // person typed into $EDITOR, which is where a hand-written serialiser breaks.
+        .{ .id = "cc", .kind = .commented, .actor = .human, .payload = "he said \"no\"\n\tand left\\", .created_at = 3, .run = null },
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    var w = Writer.Allocating.fromArrayList(a, &out);
+    try writeOk(&w.writer, 7, events);
+
+    const body = w.written();
+    const start = std.mem.indexOf(u8, body, "\"result\":").? + "\"result\":".len;
+    const back = try std.json.parseFromSliceLeaky(
+        []const Event,
+        a,
+        body[start .. body.len - 2],
+        .{},
+    );
+
+    try testing.expectEqual(events.len, back.len);
+    for (events, back) |sent, got| {
+        try testing.expectEqualStrings(sent.id, got.id);
+        try testing.expectEqual(sent.kind, got.kind);
+        try testing.expectEqual(sent.actor, got.actor);
+        try testing.expectEqualStrings(sent.payload, got.payload);
+        try testing.expectEqual(sent.created_at, got.created_at);
+        if (sent.run) |r| try testing.expectEqualStrings(r, got.run.?) else try testing.expect(got.run == null);
+    }
+}
+
+test "a board frame round-trips, with unknown and zero kept apart" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sent = Board{
+        .world = .{
+            .reachable = true,
+            .observed_at_ms = 5000,
+            .uptime_s = 90,
+            .disk_used = 10,
+            .disk_total = 80,
+            .image_digest = "sha256:deadbeef",
+            .containers = &.{.{ .name = "capsule-019fb1ce23cd", .image = "ghcr.io/x:latest" }},
+            .branches = &.{.{ .project = "capsule-abc12345", .name = "capsule/x", .commits = 3 }},
+        },
+        .projects = &.{.{
+            .short = "abc12345",
+            .name = "capsule",
+            .path = "/home/me/code/capsule/.git",
+            .profile = "default",
+            .replica = "capsule-abc12345",
+        }},
+        .project = .{
+            .replica = "capsule-abc12345",
+            .issues = .{ .open = 2, .in_progress = 1 },
+            .memory = .{ .active = 3, .cap = 40, .proposed = 0, .tokens = 700, .over_budget = false },
+        },
+        .issues = &.{
+            .{ .short = "3f2a1b9c", .state = .in_progress, .title = "live", .created_at = 10, .run = "019fb1ce", .commits = 3 },
+            .{ .short = "b8e01d77", .state = .open, .title = "never ran", .created_at = 20, .run = null, .commits = null },
+            .{ .short = "9c4a2f01", .state = .done, .title = "swept", .created_at = 30, .run = null, .commits = 0 },
+        },
+        .runs = &.{.{
+            .short = "019fb1ce",
+            .issue = "3f2a1b9c",
+            .state = .active,
+            .started_at = 1,
+            .ended_at = null,
+            .container = "capsule-019fb1ce23cd",
+            .branch = "capsule/x",
+        }},
+    };
+
+    const wire = try encoded(a, sent);
+    const start = std.mem.indexOf(u8, wire, "\"result\":").? + "\"result\":".len;
+    const back = try std.json.parseFromSliceLeaky(Board, a, wire[start .. wire.len - 2], .{});
+
+    try testing.expectEqualStrings("sha256:deadbeef", back.world.image_digest.?);
+    try testing.expectEqualStrings("capsule-abc12345", back.project.?.replica);
+    try testing.expectEqual(@as(usize, 1), back.projects.len);
+    try testing.expectEqual(@as(usize, 1), back.runs.len);
+
+    // The distinction the whole `?u64` exists for: an issue nobody has looked at reads
+    // null, an issue whose branch was swept reads 0, and they must survive the wire.
+    try testing.expectEqual(@as(?u64, 3), back.issues[0].commits);
+    try testing.expectEqual(@as(?u64, null), back.issues[1].commits);
+    try testing.expectEqual(@as(?u64, 0), back.issues[2].commits);
+    try testing.expectEqualStrings("019fb1ce", back.issues[0].run.?);
+    try testing.expectEqual(@as(?[]const u8, null), back.issues[1].run);
+    try testing.expectEqual(model.Issue.State.done, back.issues[2].state);
+}
+
+test "a board outside a project carries a null project, not an empty one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const wire = try encoded(a, Board{
+        .world = .{
+            .reachable = false,
+            .observed_at_ms = 0,
+            .uptime_s = null,
+            .disk_used = null,
+            .disk_total = null,
+            .image_digest = null,
+            .containers = &.{},
+            .branches = &.{},
+        },
+        .projects = &.{},
+        .project = null,
+        .issues = &.{},
+        .runs = &.{},
+    });
+    try testing.expect(std.mem.indexOf(u8, wire, "\"project\":null") != null);
+
+    const start = std.mem.indexOf(u8, wire, "\"result\":").? + "\"result\":".len;
+    const back = try std.json.parseFromSliceLeaky(Board, a, wire[start .. wire.len - 2], .{});
+    try testing.expectEqual(@as(?Summary, null), back.project);
 }
 
 test "a request line encodes the method and its params" {
@@ -767,7 +965,28 @@ test "every method name is unique and non-empty" {
             seen = seen ++ [_][]const u8{M.name};
         }
     }
-    try testing.expectEqual(@as(usize, 32), all.len);
+}
+
+test "every declared method is registered in `all`" {
+    // A count here used to stand in for this, but a count catches the wrong mistake:
+    // declaring `pub const issue_events = Method(...)` and forgetting to add it to `all`
+    // leaves the count exactly as it was, and the method is then unreachable from the
+    // dispatcher's own list. This walks the declarations instead.
+    @setEvalBranchQuota(20_000);
+    comptime {
+        for (@typeInfo(@This()).@"struct".decls) |decl| {
+            const field = @field(@This(), decl.name);
+            if (@TypeOf(field) != type) continue;
+            if (@typeInfo(field) != .@"struct") continue;
+            if (!@hasDecl(field, "name") or !@hasDecl(field, "Params")) continue;
+
+            var found = false;
+            for (all) |M| {
+                if (std.mem.eql(u8, M.name, field.name)) found = true;
+            }
+            if (!found) @compileError("method declared but missing from `all`: " ++ decl.name);
+        }
+    }
 }
 
 test "no params struct is ever missing the repo fields it needs" {

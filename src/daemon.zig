@@ -5,6 +5,7 @@ const net = std.Io.net;
 const Io = std.Io;
 
 const protocol = @import("protocol.zig");
+const api = @import("api.zig");
 const client_mod = @import("client.zig");
 const store_mod = @import("store.zig");
 const paths_mod = @import("paths.zig");
@@ -150,32 +151,31 @@ pub const Daemon = struct {
         ) catch {};
     }
 
-    fn writeSnapshot(d: *Daemon, arena: std.mem.Allocator, w: *Io.Writer) !void {
+    /// The poller's snapshot as the wire shape. `world.Snapshot` and `api.World` carry
+    /// the same facts but are separate types on purpose — one is what a probe observed,
+    /// the other is what the protocol promises — so the arrays are copied, not cast.
+    fn worldModel(d: *Daemon, arena: std.mem.Allocator) !api.World {
         const s = d.snapshot;
-        try w.print(
-            "{{\"reachable\":{},\"observed_at_ms\":{d},\"uptime_s\":{?d}," ++
-                "\"disk_used\":{?d},\"disk_total\":{?d},\"containers\":[",
-            .{ s.reachable, s.observed_at_ms, s.uptime_s, s.disk_used, s.disk_total },
-        );
-        for (s.containers, 0..) |container, i| {
-            if (i > 0) try w.writeAll(",");
-            try w.print("{{\"name\":", .{});
-            try std.json.Stringify.encodeJsonString(container.name, .{}, w);
-            try w.writeAll(",\"image\":");
-            try std.json.Stringify.encodeJsonString(container.image, .{}, w);
-            try w.writeAll("}");
+
+        const containers = try arena.alloc(api.Container, s.containers.len);
+        for (s.containers, containers) |from, *to| {
+            to.* = .{ .name = from.name, .image = from.image };
         }
-        try w.writeAll("],\"branches\":[");
-        for (s.branches, 0..) |branch, i| {
-            if (i > 0) try w.writeAll(",");
-            try w.writeAll("{\"project\":");
-            try std.json.Stringify.encodeJsonString(branch.project, .{}, w);
-            try w.writeAll(",\"name\":");
-            try std.json.Stringify.encodeJsonString(branch.name, .{}, w);
-            try w.print(",\"commits\":{d}}}", .{branch.commits});
+        const branches = try arena.alloc(api.Branch, s.branches.len);
+        for (s.branches, branches) |from, *to| {
+            to.* = .{ .project = from.project, .name = from.name, .commits = from.commits };
         }
-        try w.writeAll("]}");
-        _ = arena;
+
+        return .{
+            .reachable = s.reachable,
+            .observed_at_ms = s.observed_at_ms,
+            .uptime_s = s.uptime_s,
+            .disk_used = s.disk_used,
+            .disk_total = s.disk_total,
+            .image_digest = s.image_digest,
+            .containers = containers,
+            .branches = branches,
+        };
     }
 
     /// Binds and serves until `quit`. Cleans the socket up on the way out so the next
@@ -286,25 +286,7 @@ pub const Daemon = struct {
         };
 
         if (std.mem.eql(u8, verb, "list")) {
-            const rows = try d.store.listProjects(arena);
-            try w.print("{{\"id\":{d},\"ok\":true,\"result\":[", .{request.id});
-            for (rows, 0..) |row, i| {
-                if (i > 0) try w.writeAll(",");
-                try w.print("{{\"short\":\"{s}\",\"name\":", .{ids.short(row.id)});
-                try std.json.Stringify.encodeJsonString(project_mod.displayName(row.canonical_path), .{}, w);
-                try w.writeAll(",\"path\":");
-                try std.json.Stringify.encodeJsonString(row.canonical_path, .{}, w);
-                try w.writeAll(",\"profile\":");
-                try std.json.Stringify.encodeJsonString(row.profile, .{}, w);
-                try w.writeAll(",\"replica\":");
-                try std.json.Stringify.encodeJsonString(
-                    try project_mod.replicaName(arena, row.canonical_path),
-                    .{},
-                    w,
-                );
-                try w.writeAll("}");
-            }
-            return w.writeAll("]}\n");
+            return api.writeOk(w, request.id, try d.projectList(arena));
         }
 
         const canonical = d.canonicalPath(arena, params) catch
@@ -360,6 +342,26 @@ pub const Daemon = struct {
         }
 
         return protocol.writeErr(w, request.id, .unknown_method, request.method);
+    }
+
+    /// Every registered project. Shared by `project.list` and `board.get` so the picker
+    /// and the dashboard cannot show different sets.
+    fn projectList(d: *Daemon, arena: std.mem.Allocator) ![]const api.Project {
+        const rows = try d.store.listProjects(arena);
+        const out = try arena.alloc(api.Project, rows.len);
+        for (rows, out) |row, *o| {
+            // `short` hands back a fixed array by value; a struct field outlives this
+            // iteration, so it has to be copied rather than pointed at.
+            const short = ids.short(row.id);
+            o.* = .{
+                .short = try arena.dupe(u8, &short),
+                .name = project_mod.displayName(row.canonical_path),
+                .path = row.canonical_path,
+                .profile = row.profile,
+                .replica = try project_mod.replicaName(arena, row.canonical_path),
+            };
+        }
+        return out;
     }
 
     fn writeProject(
@@ -445,38 +447,7 @@ pub const Daemon = struct {
         }
 
         if (std.mem.eql(u8, verb, "summary")) {
-            const all = try d.store.listIssues(arena, project_id, null);
-            var counts = [_]usize{0} ** std.meta.fields(model_mod.Issue.State).len;
-            for (all) |row| counts[@intFromEnum(row.state)] += 1;
-
-            const active = try d.store.listMemories(arena, project_id, .active);
-            var bodies = try arena.alloc([]const u8, active.len);
-            for (active, 0..) |row, i| bodies[i] = row.body;
-            const proposals = try d.store.listMemories(arena, project_id, .proposed);
-
-            try w.print("{{\"id\":{d},\"ok\":true,\"result\":{{\"replica\":", .{request.id});
-            try std.json.Stringify.encodeJsonString(
-                try project_mod.replicaName(arena, canonical),
-                .{},
-                w,
-            );
-            try w.writeAll(",\"issues\":{");
-            inline for (std.meta.fields(model_mod.Issue.State), 0..) |field, i| {
-                if (i > 0) try w.writeAll(",");
-                try w.print("\"{s}\":{d}", .{ field.name, counts[i] });
-            }
-            try w.print(
-                "}},\"memory\":{{\"active\":{d},\"cap\":{d},\"proposed\":{d}," ++
-                    "\"tokens\":{d},\"over_budget\":{}}}}}}}\n",
-                .{
-                    active.len,
-                    memory_mod.active_cap,
-                    proposals.len,
-                    memory_mod.estimateTokens(bodies),
-                    memory_mod.overBudget(bodies),
-                },
-            );
-            return;
+            return api.writeOk(w, request.id, try d.summaryFor(arena, project_id, canonical));
         }
 
         if (std.mem.startsWith(u8, verb, "triage.")) {
@@ -499,6 +470,32 @@ pub const Daemon = struct {
 
         if (std.mem.eql(u8, verb, "get")) {
             return d.writeIssue(w, request.id, row);
+        }
+
+        if (std.mem.eql(u8, verb, "events")) {
+            const events = try d.store.listEvents(arena, row.id);
+            const out = try arena.alloc(api.Event, events.len);
+            for (events, out) |e, *o| {
+                // `toHex` and `short` hand back fixed arrays by value. Printing one
+                // directly is fine, but a struct field outlives this iteration, so each
+                // has to be copied into the arena rather than pointed at.
+                const hex = ids.toHex(e.id);
+                o.* = .{
+                    .id = try arena.dupe(u8, &hex),
+                    .kind = e.kind,
+                    .actor = e.actor,
+                    .payload = e.payload,
+                    .created_at = e.created_at,
+                    .run = if (e.run_id) |r| blk: {
+                        const s = ids.short(r);
+                        break :blk try arena.dupe(u8, &s);
+                    } else null,
+                };
+            }
+            // Through `api.writeOk` rather than a hand-written envelope: the result is a
+            // list of structs, and every brace this file writes by hand is one no test
+            // checks the balance of.
+            return api.writeOk(w, request.id, out);
         }
 
         const now = Io.Timestamp.now(d.io, .real).toMilliseconds();
@@ -631,6 +628,43 @@ pub const Daemon = struct {
         return protocol.writeErr(w, request.id, .unknown_method, request.method);
     }
 
+    /// The project's counts and memory pressure. Shared by `issue.summary` and
+    /// `board.get`: two writers of the same numbers is two chances to disagree.
+    fn summaryFor(
+        d: *Daemon,
+        arena: std.mem.Allocator,
+        project_id: ids.Id,
+        canonical: []const u8,
+    ) !api.Summary {
+        const rows = try d.store.listIssues(arena, project_id, null);
+        var tally = [_]usize{0} ** std.meta.fields(model_mod.Issue.State).len;
+        for (rows) |row| tally[@intFromEnum(row.state)] += 1;
+
+        // Copying by field name rather than by position: a state added to the enum and
+        // not to `IssueCounts` fails to compile here instead of reporting zero forever.
+        var counts = api.IssueCounts{};
+        inline for (std.meta.fields(model_mod.Issue.State), 0..) |field, i| {
+            @field(counts, field.name) = tally[i];
+        }
+
+        const active = try d.store.listMemories(arena, project_id, .active);
+        const bodies = try arena.alloc([]const u8, active.len);
+        for (active, bodies) |row, *body| body.* = row.body;
+        const proposals = try d.store.listMemories(arena, project_id, .proposed);
+
+        return .{
+            .replica = try project_mod.replicaName(arena, canonical),
+            .issues = counts,
+            .memory = .{
+                .active = active.len,
+                .cap = memory_mod.active_cap,
+                .proposed = proposals.len,
+                .tokens = memory_mod.estimateTokens(bodies),
+                .over_budget = memory_mod.overBudget(bodies),
+            },
+        };
+    }
+
     fn writeIssue(d: *Daemon, w: *Io.Writer, request_id: u64, row: store_mod.Store.IssueRow) !void {
         try w.print("{{\"id\":{d},\"ok\":true,\"result\":", .{request_id});
         try d.issueObject(w, row);
@@ -651,7 +685,29 @@ pub const Daemon = struct {
         } else {
             try w.writeAll("null");
         }
-        try w.writeAll("}");
+        try w.print(",\"created_at\":{d}}}", .{row.created_at});
+    }
+
+    /// How many runs `run.list` and the board's history pane show. Runs accumulate
+    /// forever; a dashboard that scrolls back to the first one is not a dashboard.
+    const run_list_limit = 20;
+
+    fn runModels(arena: std.mem.Allocator, rows: []const store_mod.Store.RunRow) ![]const api.Run {
+        const out = try arena.alloc(api.Run, rows.len);
+        for (rows, out) |row, *o| {
+            const short = ids.short(row.id);
+            const issue = ids.short(row.issue_id);
+            o.* = .{
+                .short = try arena.dupe(u8, &short),
+                .issue = try arena.dupe(u8, &issue),
+                .state = row.state,
+                .started_at = row.started_at,
+                .ended_at = row.ended_at,
+                .container = try store_mod.containerName(arena, row.id),
+                .branch = row.branch,
+            };
+        }
+        return out;
     }
 
     /// `capsule run` — the lifecycle of a container session.
@@ -676,23 +732,8 @@ pub const Daemon = struct {
         const now = Io.Timestamp.now(d.io, .real).toMilliseconds();
 
         if (std.mem.eql(u8, verb, "list")) {
-            const rows = try d.store.listRuns(arena, project_id, 20);
-            try w.print("{{\"id\":{d},\"ok\":true,\"result\":[", .{request.id});
-            for (rows, 0..) |row, i| {
-                if (i > 0) try w.writeAll(",");
-                try w.print(
-                    "{{\"short\":\"{s}\",\"issue\":\"{s}\",\"state\":\"{s}\"," ++
-                        "\"started_at\":{d},\"ended_at\":{?d},\"container\":\"{s}\",\"branch\":",
-                    .{
-                        ids.short(row.id),   ids.short(row.issue_id),
-                        @tagName(row.state), row.started_at,
-                        row.ended_at,        try store_mod.containerName(arena, row.id),
-                    },
-                );
-                try std.json.Stringify.encodeJsonString(row.branch, .{}, w);
-                try w.writeAll("}");
-            }
-            return w.writeAll("]}\n");
+            const rows = try d.store.listRuns(arena, project_id, run_list_limit);
+            return api.writeOk(w, request.id, try runModels(arena, rows));
         }
 
         if (std.mem.eql(u8, verb, "start")) {
@@ -1594,6 +1635,94 @@ pub const Daemon = struct {
         }
     }
 
+    /// `capsule board` — one frame of the dashboard, one lock, one instant.
+    ///
+    /// Unlike every other project-scoped method this one never refuses. Run `capsule
+    /// board` in `/tmp` and the VM panel and the project list are still worth drawing;
+    /// an error there would leave the dashboard with nothing to say at all.
+    fn dispatchBoard(
+        d: *Daemon,
+        arena: std.mem.Allocator,
+        w: *Io.Writer,
+        request: protocol.Request,
+    ) !void {
+        const empty: std.json.ObjectMap = .empty;
+        const params = switch (request.params) {
+            .object => |o| o,
+            else => empty,
+        };
+
+        var board = api.Board{
+            .world = try d.worldModel(arena),
+            .projects = try d.projectList(arena),
+            .project = null,
+            .issues = &.{},
+            .runs = &.{},
+        };
+
+        const canonical = blk: {
+            const git_dir = stringParam(params, "git_common_dir") orelse break :blk null;
+            const cwd = stringParam(params, "cwd") orelse break :blk null;
+            if (git_dir.len == 0 or cwd.len == 0) break :blk null;
+            break :blk project_mod.resolveGitDir(arena, git_dir, cwd) catch null;
+        };
+
+        if (canonical) |path| {
+            if (try d.store.findProject(path)) |project_id| {
+                const summary = try d.summaryFor(arena, project_id, path);
+                board.project = summary;
+
+                // Every run, because the branch join below needs the run that produced an
+                // old issue's branch; only the newest are sent back for display.
+                const runs = try d.store.listRuns(arena, project_id, std.math.maxInt(u32));
+                board.runs = try runModels(arena, runs[0..@min(runs.len, run_list_limit)]);
+                board.issues = try d.boardIssues(arena, project_id, summary.replica, runs);
+            }
+        }
+
+        return api.writeOk(w, request.id, board);
+    }
+
+    /// The issue rows the board lists, each joined to what is happening to it.
+    ///
+    /// Both joins happen here rather than in the board because both need something the
+    /// board cannot see: the live run comes from the same query `run start` refuses on,
+    /// so the dashboard and the refusal can never disagree, and the commit count comes
+    /// from the last VM probe.
+    fn boardIssues(
+        d: *Daemon,
+        arena: std.mem.Allocator,
+        project_id: ids.Id,
+        replica: []const u8,
+        runs: []const store_mod.Store.RunRow,
+    ) ![]const api.BoardIssue {
+        const rows = try d.store.listIssues(arena, project_id, null);
+        const live = try d.store.activeRunForProject(arena, project_id);
+
+        const out = try arena.alloc(api.BoardIssue, rows.len);
+        for (rows, out) |row, *o| {
+            const short = ids.short(row.id);
+
+            var run: ?[]const u8 = null;
+            if (live) |active| {
+                if (std.mem.eql(u8, &active.issue_id, &row.id)) {
+                    const run_short = ids.short(active.run_id);
+                    run = try arena.dupe(u8, &run_short);
+                }
+            }
+
+            o.* = .{
+                .short = try arena.dupe(u8, &short),
+                .state = row.state,
+                .title = row.title,
+                .created_at = row.created_at,
+                .run = run,
+                .commits = commitsWaiting(d.snapshot, replica, branchFor(runs, row.id)),
+            };
+        }
+        return out;
+    }
+
     fn dispatch(
         d: *Daemon,
         arena: std.mem.Allocator,
@@ -1640,9 +1769,11 @@ pub const Daemon = struct {
         }
 
         if (std.mem.eql(u8, request.method, "world.get")) {
-            try w.print("{{\"id\":{d},\"ok\":true,\"result\":", .{request.id});
-            try d.writeSnapshot(arena, w);
-            return w.writeAll("}\n");
+            return api.writeOk(w, request.id, try d.worldModel(arena));
+        }
+
+        if (std.mem.eql(u8, request.method, "board.get")) {
+            return d.dispatchBoard(arena, w, request);
         }
 
         if (std.mem.eql(u8, request.method, "daemon.stop")) {
@@ -1653,6 +1784,32 @@ pub const Daemon = struct {
         return protocol.writeErr(w, request.id, .unknown_method, request.method);
     }
 };
+
+/// The branch of this issue's most recent run, or null if it never had one. `runs`
+/// arrives newest first, so the first match is the one that matters.
+fn branchFor(runs: []const store_mod.Store.RunRow, issue_id: ids.Id) ?[]const u8 {
+    for (runs) |run| {
+        if (std.mem.eql(u8, &run.issue_id, &issue_id)) return run.branch;
+    }
+    return null;
+}
+
+/// Commits waiting on `branch` according to the last probe.
+///
+/// Null rather than zero when the VM is unreachable or the issue never had a run:
+/// "nothing is waiting" and "nobody looked" are different answers, and rendering them
+/// alike would report unseen work as finished. Zero is reserved for the case the probe
+/// actually answered — the branch is there and has nothing on it.
+fn commitsWaiting(snapshot: world_mod.Snapshot, replica: []const u8, branch: ?[]const u8) ?u64 {
+    const name = branch orelse return null;
+    if (!snapshot.reachable) return null;
+    for (snapshot.branches) |b| {
+        if (std.mem.eql(u8, b.project, replica) and std.mem.eql(u8, b.name, name)) {
+            return b.commits;
+        }
+    }
+    return 0;
+}
 
 /// The loopback HTTP endpoint the container reaches through the reverse tunnel.
 fn serveHttp(d: *Daemon) void {
@@ -1720,6 +1877,73 @@ test "a socket path over the kernel limit is rejected before binding" {
     defer threaded.deinit();
     const long = "x" ** (net.UnixAddress.max_len + 1);
     try testing.expectError(error.NameTooLong, net.UnixAddress.init(long));
+}
+
+fn testId(byte: u8) ids.Id {
+    return @splat(byte);
+}
+
+test "an issue's branch comes from its newest run, not its first" {
+    // `listRuns` returns newest first. An issue re-run after a reset has two branches in
+    // the table and only the later one is the branch anything is waiting on.
+    const runs = [_]store_mod.Store.RunRow{
+        .{
+            .id = testId(9),
+            .issue_id = testId(1),
+            .project_id = testId(0),
+            .branch = "capsule/second",
+            .state = .active,
+            .started_at = 200,
+            .ended_at = null,
+        },
+        .{
+            .id = testId(2),
+            .issue_id = testId(1),
+            .project_id = testId(0),
+            .branch = "capsule/first",
+            .state = .ended,
+            .started_at = 100,
+            .ended_at = 150,
+        },
+    };
+    try testing.expectEqualStrings("capsule/second", branchFor(&runs, testId(1)).?);
+    try testing.expectEqual(@as(?[]const u8, null), branchFor(&runs, testId(3)));
+    try testing.expectEqual(@as(?[]const u8, null), branchFor(&.{}, testId(1)));
+}
+
+test "an unreachable VM leaves the commit count unknown rather than zero" {
+    const branches = [_]world_mod.Branch{.{ .project = "mine", .name = "capsule/x", .commits = 4 }};
+
+    const down = world_mod.Snapshot{ .reachable = false, .branches = &branches };
+    try testing.expectEqual(@as(?u64, null), commitsWaiting(down, "mine", "capsule/x"));
+
+    const up = world_mod.Snapshot{ .reachable = true, .branches = &branches };
+    try testing.expectEqual(@as(?u64, 4), commitsWaiting(up, "mine", "capsule/x"));
+}
+
+test "an issue that never ran has no branch and so no count" {
+    const up = world_mod.Snapshot{ .reachable = true };
+    try testing.expectEqual(@as(?u64, null), commitsWaiting(up, "mine", null));
+}
+
+test "a branch the probe did not list has nothing waiting on it" {
+    // Swept after a merge: the branch is gone from the replica, which is zero waiting and
+    // not "unknown" — the probe looked and it was not there.
+    const up = world_mod.Snapshot{ .reachable = true, .branches = &.{} };
+    try testing.expectEqual(@as(?u64, 0), commitsWaiting(up, "mine", "capsule/x"));
+}
+
+test "another project's branch of the same name is not counted as this one's" {
+    // Replica names are `<basename>-<hash>`, so two checkouts of the same repository
+    // produce identical branch names under different projects.
+    const branches = [_]world_mod.Branch{
+        .{ .project = "capsule-aaaaaaaa", .name = "capsule/x", .commits = 7 },
+        .{ .project = "capsule-bbbbbbbb", .name = "capsule/x", .commits = 2 },
+    };
+    const up = world_mod.Snapshot{ .reachable = true, .branches = &branches };
+    try testing.expectEqual(@as(?u64, 7), commitsWaiting(up, "capsule-aaaaaaaa", "capsule/x"));
+    try testing.expectEqual(@as(?u64, 2), commitsWaiting(up, "capsule-bbbbbbbb", "capsule/x"));
+    try testing.expectEqual(@as(?u64, 0), commitsWaiting(up, "capsule-cccccccc", "capsule/x"));
 }
 
 fn stringParam(params: std.json.ObjectMap, name: []const u8) ?[]const u8 {

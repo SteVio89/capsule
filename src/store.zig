@@ -228,6 +228,7 @@ pub const Store = struct {
         body: []const u8,
         state: model.Issue.State,
         last_event_id: ?Id,
+        created_at: i64,
     };
 
     /// The column shape of `IssueRow`; `state` arrives as the text sqlite stores and is
@@ -238,6 +239,7 @@ pub const Store = struct {
         body: []const u8,
         state: []const u8,
         last_event_id: ?Id,
+        created_at: i64,
     };
 
     fn issueRow(row: IssueColumns) IssueRow {
@@ -247,7 +249,62 @@ pub const Store = struct {
             .body = row.body,
             .state = model.Issue.State.parse(row.state) orelse .open,
             .last_event_id = row.last_event_id,
+            .created_at = row.created_at,
         };
+    }
+
+    /// One entry in an issue's history.
+    ///
+    /// `payload` carries whatever the kind needs: the comment text, the archive reason,
+    /// the new title, the commit message. It is opaque to the store — the applier writes
+    /// it and the reader displays it.
+    pub const EventRow = struct {
+        id: Id,
+        kind: model.Event.Kind,
+        actor: model.Event.Actor,
+        payload: []const u8,
+        created_at: i64,
+        /// Set only when the event happened inside a run, which is what distinguishes an
+        /// agent's comment from one typed on the host.
+        run_id: ?Id,
+    };
+
+    const EventColumns = struct {
+        id: Id,
+        kind: []const u8,
+        actor: []const u8,
+        payload: []const u8,
+        created_at: i64,
+        run_id: ?Id,
+    };
+
+    /// An issue's events, oldest first.
+    ///
+    /// Nothing has ever read this table. It has been appended to since the beginning —
+    /// it is the append-only log the whole design rests on — but every consumer so far
+    /// has used `issues.state`, which is a *cache* of replaying it. Making it readable is
+    /// what turns "the state changed" into "the state changed, by whom, and why".
+    ///
+    /// Ordered by id: those are UUIDv7, so id order is time order without a sort key and
+    /// without trusting a clock that two writers might disagree about.
+    pub fn listEvents(s: *Store, arena: std.mem.Allocator, issue_id: Id) ![]EventRow {
+        var stmt = try s.db.prepare(
+            "SELECT id, kind, actor, payload, created_at, run_id FROM events " ++
+                "WHERE issue_id = ? ORDER BY id;",
+        );
+        defer stmt.deinit();
+
+        const columns = try stmt.all(EventColumns, arena, .{}, .{blob(&issue_id)});
+        const rows = try arena.alloc(EventRow, columns.len);
+        for (columns, rows) |row, *out| out.* = .{
+            .id = row.id,
+            .kind = std.meta.stringToEnum(model.Event.Kind, row.kind) orelse .commented,
+            .actor = std.meta.stringToEnum(model.Event.Actor, row.actor) orelse .human,
+            .payload = row.payload,
+            .created_at = row.created_at,
+            .run_id = row.run_id,
+        };
+        return rows;
     }
 
     /// `state_filter` of null means every state. Ordered by id, which is UUIDv7, so this
@@ -260,14 +317,14 @@ pub const Store = struct {
     ) ![]IssueRow {
         const columns = if (state_filter) |state| blk: {
             var stmt = try s.db.prepare(
-                "SELECT id, title, body, state, last_event_id FROM issues " ++
+                "SELECT id, title, body, state, last_event_id, created_at FROM issues " ++
                     "WHERE project_id = ? AND state = ? ORDER BY id;",
             );
             defer stmt.deinit();
             break :blk try stmt.all(IssueColumns, arena, .{}, .{ blob(&project_id), @tagName(state) });
         } else blk: {
             var stmt = try s.db.prepare(
-                "SELECT id, title, body, state, last_event_id FROM issues " ++
+                "SELECT id, title, body, state, last_event_id, created_at FROM issues " ++
                     "WHERE project_id = ? ORDER BY id;",
             );
             defer stmt.deinit();
@@ -288,9 +345,10 @@ pub const Store = struct {
                 body: []const u8,
                 state: []const u8,
                 last_event_id: ?Id,
+                created_at: i64,
             },
             arena,
-            "SELECT title, body, state, last_event_id FROM issues WHERE id = ?;",
+            "SELECT title, body, state, last_event_id, created_at FROM issues WHERE id = ?;",
             .{},
             .{blob(&issue_id)},
         ) orelse return null;
@@ -301,6 +359,7 @@ pub const Store = struct {
             .body = row.body,
             .state = row.state,
             .last_event_id = row.last_event_id,
+            .created_at = row.created_at,
         });
     }
 
@@ -814,6 +873,59 @@ test "a comment is recorded without moving the issue" {
     );
     try testing.expectEqual(model.Issue.State.open, next);
     try testing.expectEqual(@as(i64, 2), try s.countEvents(issue));
+}
+
+test "the event log reads back as the history it recorded" {
+    var s = try freshStore();
+    defer s.close();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const pid = seeded(1);
+    const issue = seeded(10);
+    try s.addProject(pid, "/p", "default", 1000);
+    _ = try s.createIssue(issue, pid, "t", "b", .human, seeded(11), 1001);
+    _ = try s.appendEvent(seeded(12), issue, null, .{ .kind = .commented, .actor = .human }, "mine", 1002);
+    _ = try s.appendEvent(seeded(13), issue, seeded(90), .{ .kind = .commented, .actor = .agent }, "theirs", 1003);
+
+    const events = try s.listEvents(a.allocator(), issue);
+    try testing.expectEqual(@as(usize, 3), events.len);
+
+    // Oldest first, by id — UUIDv7, so that is time order without trusting a clock.
+    try testing.expectEqual(model.Event.Kind.created, events[0].kind);
+    try testing.expectEqualStrings("mine", events[1].payload);
+    try testing.expectEqual(model.Event.Actor.human, events[1].actor);
+    try testing.expectEqualStrings("theirs", events[2].payload);
+    try testing.expectEqual(model.Event.Actor.agent, events[2].actor);
+
+    // The run id is what separates the agent's note from one typed on the host.
+    try testing.expectEqual(@as(?Id, null), events[1].run_id);
+    try testing.expect(events[2].run_id != null);
+}
+
+test "an issue with no events of its own reads as empty, not as an error" {
+    var s = try freshStore();
+    defer s.close();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), (try s.listEvents(a.allocator(), seeded(99))).len);
+}
+
+test "one issue's log does not include another's" {
+    var s = try freshStore();
+    defer s.close();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const pid = seeded(1);
+    try s.addProject(pid, "/p", "default", 1000);
+    _ = try s.createIssue(seeded(10), pid, "one", "", .human, seeded(11), 1001);
+    _ = try s.createIssue(seeded(20), pid, "two", "", .human, seeded(21), 1002);
+    _ = try s.appendEvent(seeded(22), seeded(20), null, .{ .kind = .commented, .actor = .human }, "on two", 1003);
+
+    const first = try s.listEvents(a.allocator(), seeded(10));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    for (first) |e| try testing.expect(!std.mem.eql(u8, e.payload, "on two"));
 }
 
 test "events for an unknown issue are refused" {

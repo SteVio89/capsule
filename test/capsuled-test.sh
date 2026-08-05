@@ -61,6 +61,17 @@ check "...and says which method"             "nope.method" \
 check "world.get answers even with the VM down" "false" \
   "$("$capsuled" world.get | sed 's/.*"reachable"://; s/,.*//')"
 
+check "world.get serialises the image digest" "true" \
+  "$("$capsuled" world.get | jq 'has("image_digest")')"
+
+# Every other project-scoped method refuses outside a repository. The board must not:
+# it still has the VM and the project list to draw.
+outside=$("$capsuled" board.get '{}')
+check "board.get answers outside a project" "0" "$?"
+check "...with a null project rather than an error" "null" "$(jq -c '.project' <<<"$outside")"
+check "...and the VM panel still has something to say" "false" \
+  "$(jq -c '.world.reachable' <<<"$outside")"
+
 repo="$work/repo"
 git init -q "$repo"
 gcd=$(git -C "$repo" rev-parse --git-common-dir)
@@ -78,6 +89,24 @@ check "an issue with a multi-line body is accepted" "0" "$?"
 short=$(jq -r '.short' <<<"$created")
 got=$("$capsuled" issue.get "$(jq -c --arg id "$short" '. + {id: $id}' <<<"$params")" | jq -r '.body')
 check "the body round-trips byte for byte" "$body" "$got"
+
+check "an issue reports when it was created" "true" \
+  "$("$capsuled" issue.get "$(jq -c --arg id "$short" '. + {id: $id}' <<<"$params")" \
+    | jq '.created_at > 0')"
+
+check "the event log reads back" "created" \
+  "$("$capsuled" issue.events "$(jq -c --arg id "$short" '. + {id: $id}' <<<"$params")" \
+    | jq -r '.[0].kind')"
+
+board=$("$capsuled" board.get "$params")
+check "board.get sees the project" "1" "$(jq '.projects | length' <<<"$board")"
+check "...and its issue in one call" "$short" "$(jq -r '.issues[0].short' <<<"$board")"
+check "...with no run on it yet" "null" "$(jq -c '.issues[0].run' <<<"$board")"
+# Unknown, not zero: the VM is down, so nobody has looked at any branch.
+check "...and an unknown commit count" "null" "$(jq -c '.issues[0].commits' <<<"$board")"
+check "...while the counts agree with issue.summary" \
+  "$("$capsuled" issue.summary "$params" | jq -c '.issues')" \
+  "$(jq -c '.project.issues' <<<"$board")"
 
 http_get() { # http_get <path>
   exec 3<>"/dev/tcp/127.0.0.1/$CAPSULE_MCP_PORT" || return 1

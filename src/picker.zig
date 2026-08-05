@@ -82,8 +82,11 @@ pub fn render(
     errdefer s.deinit(gpa);
 
     s.write(0, 0, prompt, .{ .bold = true });
-    s.write(prompt.len + 1, 0, query, .{});
-    s.write(prompt.len + 1 + query.len, 0, "\u{2588}", .{ .fg = .cyan });
+    // The cursor goes after what the query *draws as*, not after its bytes: a title being
+    // searched for by an ideograph would otherwise push the block cursor into it.
+    const query_start = screen_mod.displayWidth(prompt) + 1;
+    s.write(query_start, 0, query, .{});
+    s.write(query_start + screen_mod.displayWidth(query), 0, "\u{2588}", .{ .fg = .cyan });
 
     if (shown.len == 0 and h > 2) {
         s.write(0, 2, "nothing matches", .{ .fg = .dim });

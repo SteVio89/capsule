@@ -206,11 +206,25 @@ pub fn paint(fd: posix.fd_t, current: Screen, previous: ?Screen, out: *std.Array
                 if (style.bold) try out.appendSlice(gpa, "\x1b[1m");
                 if (style.reverse) try out.appendSlice(gpa, "\x1b[7m");
             }
+            // The right half of a wide character: the terminal drew both columns when it
+            // drew the left half, so emitting anything here would shift the row.
+            if (cell.ch == screen_mod.Cell.continuation) continue;
             const n = std.unicode.utf8Encode(cell.ch, &buf) catch 1;
             try out.appendSlice(gpa, buf[0..n]);
         }
         try out.appendSlice(gpa, "\x1b[0m");
     }
+
+    // Rows the previous frame used and this one does not. Nothing else ever revisits
+    // them, so without this a terminal that shrinks keeps the old rows below the new
+    // bottom edge for as long as the board is open.
+    if (previous) |prev| {
+        var y = current.h;
+        while (y < prev.h) : (y += 1) {
+            try out.print(gpa, "\x1b[{d};1H\x1b[K", .{y + 1});
+        }
+    }
+
     if (out.items.len > 0) writeAll(fd, out.items);
 }
 
@@ -341,4 +355,49 @@ test "a taller frame than the last still paints its new rows" {
     defer out.deinit(testing.allocator);
     try paint(-1, big, small, &out, testing.allocator);
     try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3;1H") != null);
+}
+
+test "a shorter frame clears the rows the last one left behind" {
+    var big = try Screen.init(testing.allocator, 4, 4);
+    defer big.deinit(testing.allocator);
+    big.write(0, 3, "old", .{});
+    var small = try Screen.init(testing.allocator, 4, 2);
+    defer small.deinit(testing.allocator);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try paint(-1, small, big, &out, testing.allocator);
+
+    // Rows 3 and 4 are outside the new frame, so nothing else will ever revisit them.
+    // Without an explicit clear the shrunk terminal keeps "old" on screen indefinitely.
+    try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3;1H\x1b[K") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[4;1H\x1b[K") != null);
+}
+
+test "a same-height frame clears nothing beyond itself" {
+    var a = try Screen.init(testing.allocator, 4, 2);
+    defer a.deinit(testing.allocator);
+    var b = try Screen.init(testing.allocator, 4, 2);
+    defer b.deinit(testing.allocator);
+    b.write(0, 0, "x", .{});
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try paint(-1, b, a, &out, testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3;1H") == null);
+}
+
+test "the right half of a wide character is not emitted twice" {
+    var s = try Screen.init(testing.allocator, 6, 1);
+    defer s.deinit(testing.allocator);
+    s.write(0, 0, "日x", .{});
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try paint(-1, s, null, &out, testing.allocator);
+
+    // The terminal advances two columns when it draws the ideograph, so the continuation
+    // cell must contribute no bytes — otherwise the row is one column too long.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.items, "日"));
+    try testing.expect(std.mem.indexOf(u8, out.items, "日x") != null);
 }
