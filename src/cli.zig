@@ -212,7 +212,8 @@ pub const Style = struct {
     }
 };
 
-/// The group listing — what `capsule` alone prints.
+/// The group listing — what `capsule help` prints, and what a bare `capsule` falls
+/// back to when there is no terminal to draw the board on.
 pub fn writeRootHelp(w: *Writer, style: Style) !void {
     try w.print(
         "\n{s}capsule{s} — run coding agents in a container, on a VM, on a git replica\n\n",

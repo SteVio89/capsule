@@ -112,6 +112,10 @@ capsule run review         # the issue's branch, PR-style in tuicr
 capsule run merge          # diffstat, confirm, squash-merge as one commit
 ```
 
+`capsule` on its own opens the board, which is where the loop above is meant to live day
+to day. `capsule help` lists every command; down a pipe, a bare `capsule` prints that list
+instead, since a dashboard is no use to a script.
+
 ## Commands
 
 **`capsule env`** — the project's Nix devshell:
@@ -205,17 +209,46 @@ they never reach a merge. The cap is **40 active and enforced**: accepting at th
 requires deactivating one in the same pass. That refusal is the entire reason curation
 happens, and a soft cap would make the set a junk drawer.
 
-**`capsule board`** — the dashboard (host only):
+**`capsule board`** — the dashboard (host only), and what a bare `capsule` opens:
 
-VM state, uptime, disk, running containers, and `capsule/*` branches with commits waiting.
-`q` quits, `r` refreshes now. It reads everything from the daemon's world model rather
-than shelling out to `capsule vm status` on a timer — each of those would be a fresh ssh
-handshake, and several per refresh would be slow and flaky.
+Three views. **Overview** is the VM, the issue counts that actually need you (never done
+or archived), the running issues by name, memory pressure, containers, and `capsule/*`
+branches with commits waiting. **Issues** is the full list, filterable by state with `f`;
+`↵` opens an issue's event log — what changed, when, and whether it was you or the agent.
+**Runs** is the session history, which draws `ended` and `abandoned` differently on
+purpose: the model separates "you quit" from "something broke", and rendering both as
+"finished" would discard the only distinction that matters.
 
-**Every mutation is a named command.** The board may eventually invoke them for you, but
-what it invokes will be the same command you could have typed — because a keystroke cannot
-be piped, scripted, called from CI, invoked from a direnv hook, or written down in an issue
-thread, and the command can.
+`↑↓`/`jk`/`gG`/page keys move, `esc` unwinds one step, `q` quits.
+
+The menu line is the command table, two levels deep — a key per group, then a key per
+verb: `i` then `l` for the issue list, `r` then `l` for runs. **The keys are derived from
+`cli.zig` rather than hand-maintained**, so a command reaches the board by being added
+there, and each key is shown beside its label because `vm` alone has `status`, `ssh`,
+`start` and `stop` all wanting `s`.
+
+**Every mutation is a named command.** A verb the board can answer itself switches view;
+every other one suspends the board, runs *the same command you could have typed*, and
+waits for a keypress before repainting — because a keystroke cannot be piped, scripted,
+called from CI, invoked from a direnv hook, or written down in an issue thread, and the
+command can.
+
+It reads everything from the daemon in one `board.get` per tick rather than shelling out
+on a timer — each of those would be a fresh ssh handshake, and two separate calls would
+let the VM panel show a container the issue panel had no run for.
+
+**`capsule doctor`** — check the backlog against its own event log (host only):
+
+`events` is the source of truth; `issues.state` is a cache of replaying it, written by the
+event applier and never invalidated. Nothing else checks the two still agree. `doctor`
+replays each issue's log and reports only the issues it has something to say about — a
+clean row printed beside a corrupt one just buries it.
+
+It exits non-zero for a verdict meaning something is wrong — including `unreadable`, a
+column this build cannot decode, which is either corruption or a store written by a newer
+capsule. The one exception is `unverifiable`: an issue whose log predates the recorded
+target state cannot be replayed either way, which is a fact about history rather than a
+fault, and failing on it would make the command useless on any store with a past.
 
 **`capsule daemon`** — the host service everything else reads from:
 

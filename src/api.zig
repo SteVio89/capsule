@@ -207,6 +207,9 @@ pub const DoctorFinding = struct {
     verdict: doctor.Verdict,
     recorded: model.Issue.State,
     replayed: ?model.Issue.State = null,
+    /// Which stored column could not be decoded, when the verdict is `unreadable`. The
+    /// `recorded` state beside it is then the store's fallback, not what the row said.
+    unreadable: ?model.Unreadable = null,
 };
 
 pub const DoctorReport = struct {

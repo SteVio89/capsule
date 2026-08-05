@@ -26,7 +26,7 @@ pub fn dispatch(
     var findings: std.ArrayList(api.DoctorFinding) = .empty;
     for (rows) |row| {
         const events = try d.store.listEvents(arena, row.id);
-        const report = try doctor_mod.check(arena, row.state, row.last_event_id, events);
+        const report = try doctor_mod.check(arena, row, events);
         if (report.verdict == .ok) continue;
 
         // `short` hands back a fixed array by value, so it has to be copied rather than
@@ -38,6 +38,7 @@ pub fn dispatch(
             .verdict = report.verdict,
             .recorded = row.state,
             .replayed = report.replayed,
+            .unreadable = report.unreadable,
         });
     }
 

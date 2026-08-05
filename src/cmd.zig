@@ -309,6 +309,15 @@ fn doctorCheck(ctx: *Ctx) u8 {
     for (report.findings) |f| {
         if (f.verdict != .unverifiable) faulty = true;
         ctx.out.print("  {s}  {s}\n", .{ f.short, f.title }) catch {};
+        if (f.unreadable) |u| {
+            // Deliberately not printing `recorded`: it is the store's fallback here, and
+            // naming it would put a state in front of the reader that nobody ever stored.
+            ctx.out.print(
+                "    unreadable: {s} holds \"{s}\", which this build does not know\n",
+                .{ u.column, u.value },
+            ) catch {};
+            continue;
+        }
         ctx.out.print("    {s}: recorded {s}", .{ @tagName(f.verdict), @tagName(f.recorded) }) catch {};
         if (f.replayed) |replayed| {
             ctx.out.print(", the log replays to {s}", .{@tagName(replayed)}) catch {};

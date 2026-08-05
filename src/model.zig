@@ -28,6 +28,16 @@ pub const Issue = struct {
     };
 };
 
+/// A stored value this build could not decode.
+///
+/// Readers keep a usable fallback beside it, so one bad row does not make a whole list
+/// unreadable — but anything drawing a conclusion from the row must check this first and
+/// say "I could not read this" rather than trusting the fallback it was given.
+pub const Unreadable = struct {
+    column: []const u8,
+    value: []const u8,
+};
+
 pub const Event = struct {
     pub const Kind = enum {
         created,

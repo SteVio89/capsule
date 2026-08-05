@@ -235,6 +235,8 @@ pub const Store = struct {
         state: model.Issue.State,
         last_event_id: ?Id,
         created_at: i64,
+        /// Set when `state` is the `.open` fallback rather than what the column said.
+        unreadable: ?model.Unreadable = null,
     };
 
     /// The column shape of `IssueRow`; `state` arrives as the text sqlite stores and is
@@ -249,11 +251,16 @@ pub const Store = struct {
     };
 
     fn issueRow(row: IssueColumns) IssueRow {
+        const state = model.Issue.State.parse(row.state);
         return .{
             .id = row.id,
             .title = row.title,
             .body = row.body,
-            .state = model.Issue.State.parse(row.state) orelse .open,
+            .state = state orelse .open,
+            .unreadable = if (state == null)
+                .{ .column = "state", .value = row.state }
+            else
+                null,
             .last_event_id = row.last_event_id,
             .created_at = row.created_at,
         };
@@ -276,6 +283,9 @@ pub const Store = struct {
         /// Where a `state_changed` moved the issue. Null for other kinds, and also for a
         /// `state_changed` written before the column existed — those cannot be replayed.
         to: ?model.Issue.State,
+        /// Set when `kind`, `actor` or `to` is a fallback rather than what the row said.
+        /// A replay must refuse rather than fold an event it could not read.
+        unreadable: ?model.Unreadable = null,
     };
 
     const EventColumns = struct {
@@ -306,15 +316,28 @@ pub const Store = struct {
 
         const columns = try stmt.all(EventColumns, arena, .{}, .{blob(&issue_id)});
         const rows = try arena.alloc(EventRow, columns.len);
-        for (columns, rows) |row, *out| out.* = .{
-            .id = row.id,
-            .kind = std.meta.stringToEnum(model.Event.Kind, row.kind) orelse .commented,
-            .actor = std.meta.stringToEnum(model.Event.Actor, row.actor) orelse .human,
-            .payload = row.payload,
-            .created_at = row.created_at,
-            .run_id = row.run_id,
-            .to = if (row.to_state) |t| std.meta.stringToEnum(model.Issue.State, t) else null,
-        };
+        for (columns, rows) |row, *out| {
+            const kind = std.meta.stringToEnum(model.Event.Kind, row.kind);
+            const actor = std.meta.stringToEnum(model.Event.Actor, row.actor);
+            const to = if (row.to_state) |t| std.meta.stringToEnum(model.Issue.State, t) else null;
+            out.* = .{
+                .id = row.id,
+                .kind = kind orelse .commented,
+                .actor = actor orelse .human,
+                .payload = row.payload,
+                .created_at = row.created_at,
+                .run_id = row.run_id,
+                .to = to,
+                .unreadable = if (kind == null)
+                    .{ .column = "kind", .value = row.kind }
+                else if (actor == null)
+                    .{ .column = "actor", .value = row.actor }
+                else if (row.to_state != null and to == null)
+                    .{ .column = "to_state", .value = row.to_state.? }
+                else
+                    null,
+            };
+        }
         return rows;
     }
 
@@ -640,7 +663,10 @@ pub const Store = struct {
             .issue_id = row.issue_id,
             .project_id = row.project_id,
             .branch = row.branch,
-            .state = std.meta.stringToEnum(model.Run.State, row.state) orelse .abandoned,
+            .state = std.meta.stringToEnum(model.Run.State, row.state) orelse blk: {
+                std.log.warn("run {s} has state '{s}', which this build does not know — reading it as abandoned", .{ ids.toHex(row.id), row.state });
+                break :blk .abandoned;
+            },
             .started_at = row.started_at,
             .ended_at = row.ended_at,
         };
@@ -743,7 +769,10 @@ pub const Store = struct {
         const rows = try arena.alloc(MemoryRow, columns.len);
         for (columns, rows) |row, *out| out.* = .{
             .id = row.id,
-            .state = std.meta.stringToEnum(model.Memory.State, row.state) orelse .proposed,
+            .state = std.meta.stringToEnum(model.Memory.State, row.state) orelse blk: {
+                std.log.warn("memory {s} has state '{s}', which this build does not know — reading it as proposed", .{ ids.toHex(row.id), row.state });
+                break :blk .proposed;
+            },
             .body = row.body,
             .anchors = row.anchors,
             .origin_issue_id = row.origin_issue_id,
@@ -911,6 +940,43 @@ test "a comment is recorded without moving the issue" {
     );
     try testing.expectEqual(model.Issue.State.open, next);
     try testing.expectEqual(@as(i64, 2), try s.countEvents(issue));
+}
+
+test "a column this build cannot decode comes back marked, not silently guessed" {
+    // Written by a newer capsule, or corrupted. The fallback keeps every other reader
+    // working; the marker is what stops `doctor` reporting drift and naming the wrong
+    // cause. Only a real column can prove the store sets it — the pure tests hand-build
+    // the row.
+    var s = try freshStore();
+    defer s.close();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const ctx = try withIssue(&s);
+
+    try s.db.exec("UPDATE issues SET state = 'frobnicated' WHERE id = ?;", .{}, .{blob(&ctx.issue)});
+    const rows = try s.listIssues(a.allocator(), ctx.project, null);
+    try testing.expectEqual(model.Issue.State.open, rows[0].state);
+    try testing.expectEqualStrings("state", rows[0].unreadable.?.column);
+    try testing.expectEqualStrings("frobnicated", rows[0].unreadable.?.value);
+
+    try s.db.exec("UPDATE events SET kind = 'deferred' WHERE issue_id = ?;", .{}, .{blob(&ctx.issue)});
+    const events = try s.listEvents(a.allocator(), ctx.issue);
+    try testing.expectEqual(model.Event.Kind.commented, events[0].kind);
+    try testing.expectEqualStrings("kind", events[0].unreadable.?.column);
+    try testing.expectEqualStrings("deferred", events[0].unreadable.?.value);
+}
+
+test "a row that decodes cleanly carries no marker" {
+    var s = try freshStore();
+    defer s.close();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const ctx = try withIssue(&s);
+
+    const rows = try s.listIssues(a.allocator(), ctx.project, null);
+    try testing.expectEqual(@as(?model.Unreadable, null), rows[0].unreadable);
+    const events = try s.listEvents(a.allocator(), ctx.issue);
+    try testing.expectEqual(@as(?model.Unreadable, null), events[0].unreadable);
 }
 
 test "a state_changed round-trips its target through sqlite, so the log replays" {
