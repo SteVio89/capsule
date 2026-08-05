@@ -130,15 +130,26 @@ pub fn execArgs(arena: std.mem.Allocator, cfg: Config, remote: []const u8) ![]co
 
 /// The same with `-t`, which allocates a remote tty. Needed by anything that draws:
 /// a login shell, `podman exec -it`, an editor on the VM.
-/// An empty `remote` means "no command" — a login shell — and the argument is omitted
-/// rather than passed as `""`.
+/// The interactive form: its own connection, a remote tty, and no command when `remote` is
+/// empty.
 ///
-/// This is not a nicety. `ssh host ""` is ssh being *given* a command to run, which the
-/// remote shell executes as nothing and exits from immediately, so `capsule vm ssh` opened
-/// a session and closed it in the same breath. bash omitted the argument when it had none;
-/// passing an empty string was the port's invention.
+/// **Deliberately not multiplexed.** Every other call rides the shared ControlMaster, which
+/// is right for the short probes the daemon fires every few seconds. An interactive session
+/// is the opposite case: it lasts as long as the user sits in it, and riding a master owned
+/// by a background daemon means the daemon's connection lifetime becomes the user's session
+/// lifetime. When the master goes, ssh reports `Control master terminated unexpectedly` and
+/// the shell dies mid-keystroke — which is what `capsule vm ssh` did, instantly and every
+/// time. One extra handshake is nothing against a session measured in minutes.
+///
+/// An empty `remote` means "no command" — a login shell — and the argument is omitted
+/// rather than passed as `""`. `ssh host ""` is ssh being *given* a command to run, which
+/// the remote shell executes as nothing and exits from. bash omitted the argument when it
+/// had none; passing an empty string was the port's invention.
 pub fn execTtyArgs(arena: std.mem.Allocator, cfg: Config, remote: []const u8) ![]const []const u8 {
-    var args = try baseArgs(arena, cfg);
+    var direct = cfg;
+    direct.control_dir = "";
+
+    var args = try baseArgs(arena, direct);
     try args.append(arena, "-t");
     try args.append(arena, cfg.vm_host);
     if (remote.len > 0) try args.append(arena, remote);
@@ -437,6 +448,30 @@ test "the remote command is one argument, so the remote shell parses it once" {
     try testing.expectEqualStrings(test_cfg.vm_host, argv[argv.len - 2]);
 }
 
+test "an interactive session gets its own connection, not the shared master" {
+    var a = testArena();
+    defer a.deinit();
+    const arena = a.allocator();
+
+    // The master is the daemon's, recreated around its poll loop. A session riding it dies
+    // with it — `Control master terminated unexpectedly`, mid-keystroke.
+    const tty = try execTtyArgs(arena, test_cfg, "");
+    for (tty) |arg| {
+        try testing.expect(std.mem.indexOf(u8, arg, "ControlPath") == null);
+        try testing.expect(std.mem.indexOf(u8, arg, "ControlMaster") == null);
+        try testing.expect(std.mem.indexOf(u8, arg, "ControlPersist") == null);
+    }
+
+    // Everything else still multiplexes: the probes are short, frequent, and pay for the
+    // handshake every time without it.
+    const plain = try execArgs(arena, test_cfg, "uptime");
+    var found = false;
+    for (plain) |arg| {
+        if (std.mem.indexOf(u8, arg, "ControlPath") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
 test "no remote command means no argument, not an empty one" {
     var a = testArena();
     defer a.deinit();
@@ -485,9 +520,10 @@ test "every form that reaches the VM carries the shared options" {
     defer a.deinit();
     const arena = a.allocator();
 
+    // `execTtyArgs` is absent on purpose — see the test below it. Every other form is a
+    // short call that should share one connection.
     const lines = [_][]const u8{
         try joined(arena, try execArgs(arena, test_cfg, "true")),
-        try joined(arena, try execTtyArgs(arena, test_cfg, "true")),
         try joined(arena, try probeArgs(arena, test_cfg)),
         try joined(arena, try masterArgs(arena, test_cfg)),
         try joined(arena, try controlArgs(arena, test_cfg, "check")),
@@ -498,6 +534,14 @@ test "every form that reaches the VM carries the shared options" {
         try testing.expect(std.mem.indexOf(u8, line, "ControlPath=/run/user/1000/capsule/cm-%C") != null);
         try testing.expect(std.mem.indexOf(u8, line, "-p 2222") != null);
     }
+
+    // The interactive form still gets the options that are not about multiplexing —
+    // dropping the master must not quietly drop the port or the host key policy with it.
+    const tty = try joined(arena, try execTtyArgs(arena, test_cfg, "true"));
+    try testing.expect(std.mem.startsWith(u8, tty, "ssh "));
+    try testing.expect(std.mem.indexOf(u8, tty, "-p 2222") != null);
+    try testing.expect(std.mem.indexOf(u8, tty, "StrictHostKeyChecking=accept-new") != null);
+    try testing.expect(std.mem.indexOf(u8, tty, "ConnectTimeout=10") != null);
 }
 
 test "a hostile image name cannot break out of its quoting" {

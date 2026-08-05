@@ -136,7 +136,7 @@ pub fn stream(io: Io, argv: []const []const u8, options: Options) Error!u8 {
 /// it would refuse to draw. Falls back to inheriting when there is no controlling
 /// terminal, which is what makes this safe to call from a script.
 pub fn interactive(io: Io, argv: []const []const u8, options: Options) Error!u8 {
-    const tty: ?Io.File = Io.Dir.cwd().openFile(io, "/dev/tty", .{ .mode = .read_write }) catch null;
+    const tty = openTty(io);
     defer if (tty) |t| t.close(io);
 
     const stdio: std.process.SpawnOptions.StdIo = if (tty) |t| .{ .file = t } else .inherit;
@@ -216,7 +216,7 @@ pub fn interactiveCapture(
     argv: []const []const u8,
     options: Options,
 ) Error!Output {
-    const tty: ?Io.File = Io.Dir.cwd().openFile(io, "/dev/tty", .{ .mode = .read_write }) catch null;
+    const tty = openTty(io);
     defer if (tty) |t| t.close(io);
 
     const stdio: std.process.SpawnOptions.StdIo = if (tty) |t| .{ .file = t } else .inherit;
@@ -245,6 +245,28 @@ pub fn interactiveCapture(
             return error.Signalled;
         },
     };
+}
+
+/// `/dev/tty`, in **blocking** mode, or null when there is no controlling terminal.
+///
+/// The second part is the whole reason this exists. `Io.Threaded` opens every file with
+/// `O_NONBLOCK`, and `SpawnOptions.StdIo.file` keeps that mode in the child — the stdlib
+/// says so and warns that children generally do not support it. A child that reads a
+/// non-blocking stdin gets `EAGAIN`, and `ssh` takes that for end of input: `capsule vm
+/// ssh` opened a session and closed it in the same instant, every time.
+///
+/// `vim` hid this for a while, because an editor opens `/dev/tty` for itself rather than
+/// trusting the descriptor it was handed.
+fn openTty(io: Io) ?Io.File {
+    const tty = Io.Dir.cwd().openFile(io, "/dev/tty", .{ .mode = .read_write }) catch return null;
+
+    // `O` is a packed struct rather than a set of constants, so the bit is derived from
+    // the struct itself instead of hardcoding a value that differs per platform.
+    const nonblock: c_int = @intCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+
+    const flags = std.c.fcntl(tty.handle, std.c.F.GETFL, @as(c_int, 0));
+    if (flags >= 0) _ = std.c.fcntl(tty.handle, std.c.F.SETFL, flags & ~nonblock);
+    return tty;
 }
 
 /// Whether a program is on `PATH`. Used for the optional dependencies capsule degrades
