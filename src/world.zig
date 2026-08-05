@@ -5,9 +5,15 @@ const std = @import("std");
 /// One `key<TAB>value` line per fact. The script travels inside the ssh remote command
 /// (see `ssh.probeArgs`) and the daemon parses its output — a shape both sides can be
 /// read and checked by eye, which matters more here than compactness.
+///
+/// **Disk is measured at `/var`, never `/`.** On Fedora CoreOS `/` is a composefs: a
+/// read-only overlay of a few megabytes, which the board faithfully reported as "0 GB of
+/// 0 GB" for as long as it existed. Everything that actually consumes space is under
+/// `/var` — podman's images and containers in `/var/lib/containers`, the replicas in
+/// `/var/home/core/capsule`.
 pub const probe_script =
     \\printf 'uptime\t%s\n' "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
-    \\df -P / | awk 'NR==2 {printf "disk_used\t%s\ndisk_total\t%s\n", $3*1024, $2*1024}'
+    \\df -P /var | awk 'NR==2 {printf "disk_used\t%s\ndisk_total\t%s\n", $3*1024, $2*1024}'
     \\podman ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null |
     \\  while IFS="$(printf '\t')" read -r n i; do printf 'container\t%s\t%s\n' "$n" "$i"; done
     \\for d in ~/capsule/*/; do

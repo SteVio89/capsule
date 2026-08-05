@@ -7,6 +7,7 @@ const api = @import("api.zig");
 const client = @import("client.zig");
 const exec = @import("exec.zig");
 const world = @import("world.zig");
+const model = @import("model.zig");
 const term = @import("tui/term.zig");
 const board_render = @import("tui/board.zig");
 const screen_mod = @import("tui/screen.zig");
@@ -57,10 +58,14 @@ pub fn run(
         const view = fetch(frame.allocator(), io, socket_path, project_params);
 
         const size = t.size();
-        state.sync(view.issues.len, board_render.listHeight(view.project != null, size.h));
+        // The cursor indexes what is drawn, so everything downstream sees the filtered
+        // set — otherwise the selection and the screen disagree the moment a filter hides
+        // the row it was on.
+        const shown = filterIssues(frame.allocator(), view.issues, state.filter);
+        state.sync(shown.len, board_render.listHeight(size.h));
         const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
 
-        const selected = state.selected(view.issues);
+        const selected = state.selected(shown);
         if (selected == null) state.detail = false;
 
         var current = if (state.detail and selected != null) detail: {
@@ -71,7 +76,7 @@ pub fn run(
             gpa,
             view.snapshot,
             view.project,
-            view.issues,
+            shown,
             state,
             now_ms,
             size.w,
@@ -119,49 +124,91 @@ pub fn run(
                 continue;
             }
 
-            switch (key) {
-                .key => |b| switch (b) {
-                    'q', 3 => return,
-                    'r' => break,
-                    '\r', '\n' => {
-                        state.detail = true;
+            // Inside a group the menu owns every letter, because the footer is showing
+            // exactly which ones mean something. Letting the list keep `j` and `k` here
+            // would move a selection while the reader is looking at a command list.
+            if (state.menu.len > 0) {
+                switch (key) {
+                    .escape => {
+                        state.menu = "";
                         break;
                     },
-                    'n' => {
-                        newIssue(&t, io, frame.allocator(), exe_path);
-                        acted = true;
-                        break;
-                    },
-                    // Dispatches the row under the cursor, which is the whole reason the
-                    // list is selectable — `run start` otherwise opens a picker to ask
-                    // what the board is already showing.
-                    's' => {
-                        if (selected) |issue| {
-                            shellOut(&t, io, &.{ exe_path, "run", "start", issue.short });
+                    .key => |b| {
+                        if (b == 3) return;
+                        if (b == 27) {
+                            state.menu = "";
+                            break;
+                        }
+                        var buf: [32]board_render.Entry = undefined;
+                        const entries = board_render.verbEntries(&buf, state.menu);
+                        if (board_render.entryFor(entries, b)) |entry| {
+                            const group = state.menu;
+                            state.menu = "";
+
+                            // A verb the board can answer itself changes the view instead
+                            // of running anything — `issue list` would otherwise print a
+                            // list onto a screen the dashboard repaints a moment later.
+                            if (viewFor(group, entry.verb)) |v| {
+                                state.view = v;
+                                break;
+                            }
+                            runEntry(&t, io, frame.allocator(), exe_path, group, entry, selected);
                             acted = true;
                             break;
                         }
                     },
-                    't' => {
-                        shellOut(&t, io, &.{ exe_path, "issue", "triage" });
-                        acted = true;
-                        break;
-                    },
-                    'M' => {
-                        shellOut(&t, io, &.{ exe_path, "memory", "review" });
-                        acted = true;
-                        break;
-                    },
+                    .closed => return,
                     else => {},
+                }
+                continue;
+            }
+
+            // `esc` unwinds one step rather than quitting: from a view back to the
+            // overview, and from the overview nowhere. Quitting stays on `q` alone, so a
+            // reflexive escape can never end the session.
+            if (key == .escape and state.view != .overview) {
+                state.view = .overview;
+                break;
+            }
+
+            switch (key) {
+                .key => |b| switch (b) {
+                    'q', 3 => return,
+                    27 => {
+                        if (state.view != .overview) {
+                            state.view = .overview;
+                            break;
+                        }
+                    },
+                    '\r', '\n' => {
+                        state.detail = true;
+                        break;
+                    },
+                    'f' => {
+                        if (state.view == .issues) {
+                            state.filter = nextFilter(state.filter);
+                            break;
+                        }
+                    },
+                    else => {
+                        // A group key opens the menu. Checked before the list so a letter
+                        // the footer is advertising cannot be swallowed as navigation —
+                        // `r` for the run group would otherwise never arrive.
+                        var buf: [32]board_render.Entry = undefined;
+                        const groups = board_render.groupEntries(&buf);
+                        if (board_render.entryFor(groups, b)) |entry| {
+                            state.menu = entry.label;
+                            break;
+                        }
+                    },
                 },
                 .closed => return,
                 else => {},
             }
 
-            // Offered to the list after the board's own keys, so `q` stays quit rather
-            // than becoming whatever a list might one day want it for. A key the list
-            // takes repaints immediately: waiting out the refresh would make the cursor
-            // feel like it was lagging behind the keyboard.
+            // Offered to the list last, so a key the menu claims stays the menu's. A key
+            // the list takes repaints immediately: waiting out the refresh would make the
+            // cursor feel like it was lagging behind the keyboard.
             if (state.issues.handle(key) == .moved) break;
         }
     }
@@ -215,19 +262,102 @@ fn shellOut(t: *term.Term, io: Io, argv: []const []const u8) void {
     _ = exec.interactive(io, argv, .{}) catch {};
 }
 
-/// `n` — asks for a title on the plain terminal, then hands over to `issue new`, which
-/// opens the body in `$EDITOR`.
+/// Runs the command a menu entry names, filling in whatever its arguments ask for.
 ///
-/// One `leaveRaw`/`enterRaw` around both the prompt and the command: doing it separately
-/// flickers the alternate screen in and out between typing the title and the editor
-/// appearing, which reads as a glitch rather than a step.
-fn newIssue(t: *term.Term, io: Io, arena: std.mem.Allocator, exe_path: []const u8) void {
+/// `cli.Command.args` is the help text's own spelling — `"<title>"`, `"[issue-id]"` — and
+/// it is the only place that records what a verb wants. Reading it here means the menu
+/// learns a new command's shape from the same line that documents it, rather than from a
+/// second table that would drift.
+///
+/// One `leaveRaw`/`enterRaw` around the prompt *and* the command: separating them flickers
+/// the alternate screen in and out between typing a title and the editor appearing, which
+/// reads as a glitch rather than a step.
+fn runEntry(
+    t: *term.Term,
+    io: Io,
+    arena: std.mem.Allocator,
+    exe_path: []const u8,
+    group: []const u8,
+    entry: board_render.Entry,
+    selected: ?api.BoardIssue,
+) void {
     t.leaveRaw();
     defer t.enterRaw() catch {};
 
-    const title = askLine(arena, io, "title (empty to cancel): ") orelse return;
-    const argv: []const []const u8 = &.{ exe_path, "issue", "new", title };
-    _ = exec.interactive(io, argv, .{}) catch {};
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(arena, &.{ exe_path, group, entry.verb }) catch return;
+
+    // The id first, then the title, which is the order every such command spells them in.
+    if (std.mem.indexOf(u8, entry.args, "id") != null) {
+        if (selected) |issue| argv.append(arena, issue.short) catch return;
+    }
+    if (std.mem.indexOf(u8, entry.args, "title") != null) {
+        const title = askLine(arena, io, "title (empty to cancel): ") orelse return;
+        argv.append(arena, title) catch return;
+    }
+
+    _ = exec.interactive(io, argv.items, .{}) catch {};
+
+    // Without this the dashboard repaints over the output within milliseconds, which is
+    // why every command that only prints — `vm status`, `run list`, `project list` —
+    // appeared to do nothing at all. A command the board runs is a command you must be
+    // able to read the answer to.
+    waitForKey(io, "\n[any key]");
+}
+
+/// Blocks until one byte arrives on the terminal. Silent on failure: the caller has
+/// already run the command, and a prompt that cannot be shown is not worth an error.
+fn waitForKey(io: Io, note: []const u8) void {
+    const tty = Io.Dir.cwd().openFile(io, "/dev/tty", .{ .mode = .read_write }) catch return;
+    defer tty.close(io);
+
+    var out: [64]u8 = undefined;
+    var writer = tty.writer(io, &out);
+    writer.interface.writeAll(note) catch {};
+    writer.interface.flush() catch {};
+
+    var buf: [8]u8 = undefined;
+    var reader = tty.readerStreaming(io, &buf);
+    _ = reader.interface.takeByte() catch {};
+}
+
+/// The view a verb opens instead of shelling out.
+///
+/// `issue list` is the board's own main view: shelling out would print a list and hand
+/// back a screen the dashboard immediately paints over. Verbs with no view here still run
+/// as commands, which is the right default — the board should not grow a second, worse
+/// implementation of `run list` just to avoid a subprocess.
+fn viewFor(group: []const u8, verb: []const u8) ?board_render.View {
+    if (std.mem.eql(u8, group, "issue") and std.mem.eql(u8, verb, "list")) return .issues;
+    return null;
+}
+
+/// The issues the current filter admits, in the frame's arena.
+///
+/// Filtering here rather than in `render` keeps one truth: the cursor indexes what is on
+/// screen, so a selection can never point at a row the filter has hidden.
+fn filterIssues(
+    arena: std.mem.Allocator,
+    issues: []const api.BoardIssue,
+    filter: ?model.Issue.State,
+) []const api.BoardIssue {
+    if (filter == null) return issues;
+
+    var out: std.ArrayList(api.BoardIssue) = .empty;
+    for (issues) |issue| {
+        if (board_render.matches(issue, filter)) out.append(arena, issue) catch return issues;
+    }
+    return out.toOwnedSlice(arena) catch issues;
+}
+
+/// The next filter in `board_render.filters`, wrapping.
+fn nextFilter(current: ?model.Issue.State) ?model.Issue.State {
+    for (board_render.filters, 0..) |f, i| {
+        const same = (f == null and current == null) or
+            (f != null and current != null and f.? == current.?);
+        if (same) return board_render.filters[(i + 1) % board_render.filters.len];
+    }
+    return null;
 }
 
 /// Asks for one line on the restored terminal. Null when the reader cancelled with an
