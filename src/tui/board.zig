@@ -38,13 +38,16 @@ pub const Project = struct {
 /// The board opens on `overview` — what is true right now, at a glance — and a command
 /// switches it. `issue list` is not a panel that is always there taking space; it is a
 /// view you ask for, the same way you would have typed the command.
-pub const View = enum { overview, issues };
+pub const View = enum { overview, issues, runs };
 
 pub const State = struct {
     view: View = .overview,
     /// Which state the issue view is showing, or null for all of them.
     filter: ?model.Issue.State = null,
     issues: list_mod.List = .{},
+    /// The run view's own cursor. Separate from the issue list's, so moving through one
+    /// does not silently move the other underneath a view the reader is about to open.
+    runs: list_mod.List = .{},
     /// Whether the event log for the selected issue is open. The board otherwise reports
     /// that an issue is blocked without ever saying who blocked it or why — the log has
     /// been written since the first commit and read by nothing.
@@ -60,6 +63,13 @@ pub const State = struct {
         self.issues.len = count;
         self.issues.height = height;
         self.issues.clamp();
+    }
+
+    /// The run view's equivalent, kept apart for the same reason its cursor is.
+    pub fn syncRuns(self: *State, count: usize, height: usize) void {
+        self.runs.len = count;
+        self.runs.height = height;
+        self.runs.clamp();
     }
 
     /// The issue the cursor is on, or null when there are none.
@@ -78,6 +88,7 @@ pub fn render(
     snapshot: world.Snapshot,
     project: ?Project,
     issues: []const api.BoardIssue,
+    runs: []const api.Run,
     state: State,
     now_ms: i64,
     w: usize,
@@ -92,15 +103,20 @@ pub fn render(
     // next frame; doing it in both places is what makes neither depend on the other.
     var view = state;
     view.sync(issues.len, listHeight(h));
+    view.syncRuns(runs.len, listHeight(h));
 
     var y: usize = 0;
     s.write(0, y, "capsule", .{ .bold = true });
-    if (view.view == .issues) {
+    switch (view.view) {
         // Named here rather than in the menu line, which has no room for it once eight
         // group labels are on it. A filter you cannot see is a list that looks incomplete.
-        var head: [48]u8 = undefined;
-        const text = std.fmt.bufPrint(&head, "issues · {s}", .{filterLabel(view.filter)}) catch "issues";
-        s.write(8, y, text, .{ .fg = .cyan });
+        .issues => {
+            var head: [48]u8 = undefined;
+            const text = std.fmt.bufPrint(&head, "issues · {s}", .{filterLabel(view.filter)}) catch "issues";
+            s.write(8, y, text, .{ .fg = .cyan });
+        },
+        .runs => s.write(8, y, "runs", .{ .fg = .cyan }),
+        .overview => {},
     }
 
     var age_buf: [32]u8 = undefined;
@@ -117,11 +133,81 @@ pub fn render(
         // The list gets the whole screen when it *is* the screen: two rows of chrome
         // above and the menu below, rather than the leftovers of five panels.
         .issues => _ = renderIssueList(&s, issues, view, y, listHeight(h)),
+        .runs => renderRunList(&s, runs, view, now_ms, y, listHeight(h)),
         .overview => renderOverview(&s, snapshot, project, issues, y, h),
     }
 
     if (h >= 2) renderMenu(&s, view, h - 1);
     return s;
+}
+
+/// The run history: what an agent did, on which issue, and how it ended.
+///
+/// `ended` and `abandoned` are drawn apart on purpose. The model keeps them separate
+/// because "the user quit" and "something broke" want different reactions from you, and a
+/// view that renders both as "finished" throws away the only distinction that matters.
+fn renderRunList(
+    s: *Screen,
+    runs: []const api.Run,
+    state: State,
+    now_ms: i64,
+    start: usize,
+    height: usize,
+) void {
+    var y = start;
+    if (runs.len == 0) {
+        s.write(0, y, "no runs yet — 'capsule run start'", .{ .fg = .dim });
+        return;
+    }
+
+    const limit = start + height;
+    const range = state.runs.visible();
+    for (range.start..range.end) |i| {
+        if (y >= limit or y >= s.h) break;
+        renderRunRow(s, runs[i], state.runs.styleFor(i, .{}), now_ms, y);
+        y += 1;
+    }
+
+    if (range.end < runs.len and y < s.h) {
+        var buf: [32]u8 = undefined;
+        const more = std.fmt.bufPrint(&buf, "{d} more below", .{runs.len - range.end}) catch "more";
+        s.write(2, y, more, .{ .fg = .dim });
+    }
+}
+
+fn renderRunRow(s: *Screen, run: api.Run, base: Style, now_ms: i64, y: usize) void {
+    if (base.reverse) {
+        for (s.row(y)) |*cell| cell.* = .{ .ch = ' ', .style = base };
+    }
+
+    if (run.state == .active) s.write(0, y, "●", withFg(base, .green));
+    s.write(2, y, run.short, base);
+
+    const label: []const u8 = switch (run.state) {
+        .active => "active",
+        .ended => "ended",
+        .abandoned => "abandoned",
+    };
+    const colour: screen.Color = switch (run.state) {
+        .active => .green,
+        .ended => .dim,
+        .abandoned => .red,
+    };
+    s.write(12, y, label, withFg(base, colour));
+
+    s.write(24, y, run.issue, base);
+
+    // How long it ran, or how long it has been running — the same question either way,
+    // and the one a wall-clock start time makes you compute yourself.
+    var buf: [24]u8 = undefined;
+    const until = run.ended_at orelse now_ms;
+    const age = relativeAge(&buf, until - run.started_at);
+    s.write(34, y, age, withFg(base, .dim));
+
+    if (s.w > 44) {
+        const branch = truncate(run.branch, s.w - 44);
+        s.write(42, y, branch.text, withFg(base, .dim));
+    }
 }
 
 /// What is true right now, at a glance: the VM, what is running, what is waiting on you.
@@ -774,7 +860,7 @@ fn findRow(s: Screen, needle: []const u8) !?usize {
 }
 
 test "an unreachable VM says so and shows no figures" {
-    var s = try render(testing.allocator, .{}, null, &.{}, .{}, 1000, 80, 24);
+    var s = try render(testing.allocator, .{}, null, &.{}, &.{}, .{}, 1000, 80, 24);
     defer s.deinit(testing.allocator);
 
     try expectRowContains(s, 0, "capsule");
@@ -797,7 +883,7 @@ test "a healthy VM shows uptime, disk, containers and branches" {
             .{ .project = "p", .name = "capsule/018f2a3d", .commits = 0 },
         },
     };
-    var s = try render(testing.allocator, snapshot, null, &.{}, .{}, 12_000, 80, 24);
+    var s = try render(testing.allocator, snapshot, null, &.{}, &.{}, .{}, 12_000, 80, 24);
     defer s.deinit(testing.allocator);
 
     try expectRowContains(s, 0, "3s ago");
@@ -816,7 +902,7 @@ test "one commit is not pluralised" {
         .observed_at_ms = 1,
         .branches = &.{.{ .project = "p", .name = "capsule/x", .commits = 1 }},
     };
-    var s = try render(testing.allocator, snapshot, null, &.{}, .{}, 1, 80, 24);
+    var s = try render(testing.allocator, snapshot, null, &.{}, &.{}, .{}, 1, 80, 24);
     defer s.deinit(testing.allocator);
     try testing.expect((try findRow(s, "1 commit")) != null);
     try testing.expect((try findRow(s, "1 commits")) == null);
@@ -824,7 +910,7 @@ test "one commit is not pluralised" {
 
 test "empty sections say so rather than leaving a gap" {
     const snapshot = world.Snapshot{ .reachable = true, .observed_at_ms = 1 };
-    var s = try render(testing.allocator, snapshot, null, &.{}, .{}, 1, 80, 24);
+    var s = try render(testing.allocator, snapshot, null, &.{}, &.{}, .{}, 1, 80, 24);
     defer s.deinit(testing.allocator);
     try testing.expect((try findRow(s, "none running")) != null);
     try testing.expect((try findRow(s, "nothing waiting")) != null);
@@ -837,13 +923,13 @@ test "a nearly full disk is flagged" {
         .disk_used = 76 * (1 << 30),
         .disk_total = 80 * (1 << 30),
     };
-    var s = try render(testing.allocator, snapshot, null, &.{}, .{}, 1, 80, 24);
+    var s = try render(testing.allocator, snapshot, null, &.{}, &.{}, .{}, 1, 80, 24);
     defer s.deinit(testing.allocator);
     const y = (try findRow(s, "95%")).?;
     try testing.expectEqual(screen.Color.red, s.row(y)[12].style.fg);
 
     snapshot.disk_used = 10 * (1 << 30);
-    var ok = try render(testing.allocator, snapshot, null, &.{}, .{}, 1, 80, 24);
+    var ok = try render(testing.allocator, snapshot, null, &.{}, &.{}, .{}, 1, 80, 24);
     defer ok.deinit(testing.allocator);
     const oy = (try findRow(ok, "12%")).?;
     try testing.expectEqual(screen.Color.default, ok.row(oy)[12].style.fg);
@@ -861,7 +947,7 @@ test "a cramped terminal renders without crashing or overflowing" {
     };
     for ([_]usize{ 1, 5, 20, 40 }) |w| {
         for ([_]usize{ 1, 2, 6, 24 }) |h| {
-            var s = try render(testing.allocator, snapshot, null, &.{}, .{}, 1, w, h);
+            var s = try render(testing.allocator, snapshot, null, &.{}, &.{}, .{}, 1, w, h);
             defer s.deinit(testing.allocator);
             try testing.expectEqual(w * h, s.cells.len);
         }
@@ -886,6 +972,7 @@ fn renderSample(state: State, w: usize, h: usize) !Screen {
         .{ .reachable = true, .observed_at_ms = 1 },
         Project{ .memory_active = 12 },
         &sample_issues,
+        &.{},
         s,
         1,
         w,
@@ -945,6 +1032,7 @@ test "an empty backlog says what to type instead of drawing a blank pane" {
         testing.allocator,
         .{ .reachable = true, .observed_at_ms = 1 },
         Project{},
+        &.{},
         &.{},
         .{ .view = .issues },
         1,
@@ -1023,6 +1111,7 @@ fn menuLine(state: State) ![]u8 {
         .{ .reachable = true, .observed_at_ms = 1 },
         Project{},
         &sample_issues,
+        &.{},
         state,
         1,
         100,
@@ -1076,12 +1165,83 @@ test "a filter narrows the view to one state, and names which" {
     try testing.expect(!matches(sample_issues[0], .blocked));
 }
 
+const sample_runs = [_]api.Run{
+    .{ .short = "019fb1ce", .issue = "3f2a1b9c", .state = .active, .started_at = 0, .ended_at = null, .container = "capsule-019fb1ce", .branch = "capsule/3f2a1b9c" },
+    .{ .short = "019fa000", .issue = "b8e01d77", .state = .ended, .started_at = 0, .ended_at = 120_000, .container = "", .branch = "capsule/b8e01d77" },
+    .{ .short = "019f9111", .issue = "9c4a2f01", .state = .abandoned, .started_at = 0, .ended_at = 60_000, .container = "", .branch = "capsule/9c4a2f01" },
+};
+
+fn renderRuns(state: State) !Screen {
+    var s = state;
+    s.view = .runs;
+    return render(
+        testing.allocator,
+        .{ .reachable = true, .observed_at_ms = 1 },
+        Project{},
+        &sample_issues,
+        &sample_runs,
+        s,
+        180_000,
+        100,
+        40,
+    );
+}
+
+test "a quit run and a broken one do not read alike" {
+    var s = try renderRuns(.{});
+    defer s.deinit(testing.allocator);
+
+    // The model keeps `ended` and `abandoned` apart precisely so this view can.
+    try testing.expect((try findRow(s, "ended")) != null);
+    const broken = (try findRow(s, "abandoned")).?;
+    try testing.expectEqual(screen.Color.red, s.row(broken)[12].style.fg);
+
+    // A run still going is marked, and its age counts up from the start rather than
+    // showing nothing because it has no end.
+    const live = (try findRow(s, "019fb1ce")).?;
+    try testing.expectEqual(@as(u21, '●'), s.row(live)[0].ch);
+    const text = try s.rowText(testing.allocator, live);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "3m") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "3f2a1b9c") != null);
+}
+
+test "the run view has its own cursor, not the issue list's" {
+    var state = State{};
+    state.syncRuns(sample_runs.len, 10);
+    state.runs.moveTo(2);
+    // The issue cursor stays put: opening one view must not move the other underneath.
+    try testing.expectEqual(@as(usize, 0), state.issues.cursor);
+
+    var s = try renderRuns(state);
+    defer s.deinit(testing.allocator);
+    const selected = (try findRow(s, "019f9111")).?;
+    try testing.expect(s.row(selected)[0].style.reverse);
+}
+
+test "no runs says so rather than drawing an empty screen" {
+    var s = try render(
+        testing.allocator,
+        .{ .reachable = true, .observed_at_ms = 1 },
+        Project{},
+        &.{},
+        &.{},
+        .{ .view = .runs },
+        1,
+        100,
+        40,
+    );
+    defer s.deinit(testing.allocator);
+    try testing.expect((try findRow(s, "capsule run start")) != null);
+}
+
 test "the overview shows what needs you, and not the whole backlog" {
     var s = try render(
         testing.allocator,
         .{ .reachable = true, .observed_at_ms = 1 },
         Project{ .issues = .{ 2, 3, 1, 0, 4, 7, 1 }, .memory_active = 12 },
         &sample_issues,
+        &.{},
         .{},
         1,
         100,
@@ -1179,6 +1339,7 @@ test "a title too wide for its column is cut with an ellipsis" {
         .{ .reachable = true, .observed_at_ms = 1 },
         Project{},
         &long,
+        &.{},
         .{ .view = .issues },
         1,
         60,
@@ -1198,13 +1359,13 @@ test "a title too wide for its column is cut with an ellipsis" {
 
 test "the memory panel shows the cap and warns at it" {
     const under = Project{ .memory_active = 12, .memory_cap = 40, .memory_tokens = 900 };
-    var a = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, under, &.{}, .{}, 1, 100, 40);
+    var a = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, under, &.{}, &.{}, .{}, 1, 100, 40);
     defer a.deinit(testing.allocator);
     const row = (try findRow(a, "12/40 active")).?;
     try testing.expectEqual(screen.Color.default, a.row(row)[12].style.fg);
 
     const at_cap = Project{ .memory_active = 40, .memory_cap = 40, .memory_proposed = 3 };
-    var b = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, at_cap, &.{}, .{}, 1, 100, 40);
+    var b = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, at_cap, &.{}, &.{}, .{}, 1, 100, 40);
     defer b.deinit(testing.allocator);
     const capped = (try findRow(b, "40/40 active")).?;
     try testing.expectEqual(screen.Color.yellow, b.row(capped)[12].style.fg);
@@ -1213,14 +1374,14 @@ test "the memory panel shows the cap and warns at it" {
 
 test "the token estimate is labelled approximate" {
     const p = Project{ .memory_active = 40, .memory_tokens = 3400, .memory_over_budget = true };
-    var s = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, p, &.{}, .{}, 1, 100, 40);
+    var s = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, p, &.{}, &.{}, .{}, 1, 100, 40);
     defer s.deinit(testing.allocator);
     try testing.expect((try findRow(s, "~3400 (approx)")) != null);
 }
 
 test "a claim with no commits is called out, and so is the reverse" {
     const claimed = Project{ .issues = .{ 0, 0, 0, 0, 2, 0, 0 } };
-    var a = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, claimed, &.{}, .{}, 1, 100, 40);
+    var a = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, claimed, &.{}, &.{}, .{}, 1, 100, 40);
     defer a.deinit(testing.allocator);
     try testing.expect((try findRow(a, "2 claimed ready with no commits waiting")) != null);
 
@@ -1233,7 +1394,7 @@ test "a claim with no commits is called out, and so is the reverse" {
         },
     };
     const silent = Project{ .replica = "p", .issues = .{ 0, 0, 2, 0, 0, 0, 0 } }; // in progress, none ready
-    var b = try render(testing.allocator, snapshot, silent, &.{}, .{}, 1, 100, 40);
+    var b = try render(testing.allocator, snapshot, silent, &.{}, &.{}, .{}, 1, 100, 40);
     defer b.deinit(testing.allocator);
     try testing.expect((try findRow(b, "2 with commits the agent never reported")) != null);
 }
@@ -1248,7 +1409,7 @@ test "another project's waiting branches do not contradict this project's claims
         },
     };
     const idle = Project{ .replica = "mine", .issues = .{0} ** 7 };
-    var s = try render(testing.allocator, snapshot, idle, &.{}, .{}, 1, 100, 40);
+    var s = try render(testing.allocator, snapshot, idle, &.{}, &.{}, .{}, 1, 100, 40);
     defer s.deinit(testing.allocator);
     try testing.expect((try findRow(s, "never reported")) == null);
     try testing.expect((try findRow(s, "claimed ready")) == null);
@@ -1256,7 +1417,7 @@ test "another project's waiting branches do not contradict this project's claims
 }
 
 test "without a project the board still renders the VM alone" {
-    var s = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, null, &.{}, .{}, 1, 80, 24);
+    var s = try render(testing.allocator, .{ .reachable = true, .observed_at_ms = 1 }, null, &.{}, &.{}, .{}, 1, 80, 24);
     defer s.deinit(testing.allocator);
     // By panel content, not by heading: the footer names every action key, so "memory"
     // and "issues" both appear there whatever the panels above do.

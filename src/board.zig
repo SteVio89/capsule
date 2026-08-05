@@ -63,6 +63,7 @@ pub fn run(
         // the row it was on.
         const shown = filterIssues(frame.allocator(), view.issues, state.filter);
         state.sync(shown.len, board_render.listHeight(size.h));
+        state.syncRuns(view.runs.len, board_render.listHeight(size.h));
         const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
 
         const selected = state.selected(shown);
@@ -77,6 +78,7 @@ pub fn run(
             view.snapshot,
             view.project,
             shown,
+            view.runs,
             state,
             now_ms,
             size.w,
@@ -181,8 +183,14 @@ pub fn run(
                         }
                     },
                     '\r', '\n' => {
-                        state.detail = true;
-                        break;
+                        // The log belongs to an issue. A run has one too, through its
+                        // issue, but opening it from here would need a lookup the board
+                        // does not have — so the key simply does nothing in the run view
+                        // rather than opening the wrong issue's history.
+                        if (state.view != .runs) {
+                            state.detail = true;
+                            break;
+                        }
                     },
                     'f' => {
                         if (state.view == .issues) {
@@ -209,7 +217,11 @@ pub fn run(
             // Offered to the list last, so a key the menu claims stays the menu's. A key
             // the list takes repaints immediately: waiting out the refresh would make the
             // cursor feel like it was lagging behind the keyboard.
-            if (state.issues.handle(key) == .moved) break;
+            const moved = switch (state.view) {
+                .runs => state.runs.handle(key),
+                else => state.issues.handle(key),
+            };
+            if (moved == .moved) break;
         }
     }
 }
@@ -329,6 +341,7 @@ fn waitForKey(io: Io, note: []const u8) void {
 /// implementation of `run list` just to avoid a subprocess.
 fn viewFor(group: []const u8, verb: []const u8) ?board_render.View {
     if (std.mem.eql(u8, group, "issue") and std.mem.eql(u8, verb, "list")) return .issues;
+    if (std.mem.eql(u8, group, "run") and std.mem.eql(u8, verb, "list")) return .runs;
     return null;
 }
 
@@ -588,7 +601,7 @@ test "a frame from the daemon draws without a terminal" {
     var a = std.heap.ArenaAllocator.init(testing.allocator);
     defer a.deinit();
     const f = parseFrame(a.allocator(), full_frame);
-    var drawn = try board_render.render(testing.allocator, f.snapshot, f.project, f.issues, .{}, 2000, 80, 24);
+    var drawn = try board_render.render(testing.allocator, f.snapshot, f.project, f.issues, f.runs, .{}, 2000, 80, 24);
     defer drawn.deinit(testing.allocator);
     const first = try drawn.rowText(testing.allocator, 0);
     defer testing.allocator.free(first);

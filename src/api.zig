@@ -16,6 +16,7 @@ const Io = std.Io;
 const Writer = std.Io.Writer;
 
 const protocol = @import("protocol.zig");
+const doctor = @import("doctor.zig");
 const model = @import("model.zig");
 const client = @import("client.zig");
 
@@ -193,6 +194,25 @@ pub const StaleMemory = struct {
 pub const GcRun = struct {
     dir: []const u8,
     container: []const u8,
+};
+
+/// One issue `doctor.check` had something to say about. Clean issues are not reported —
+/// a health check that prints every healthy row buries the one unhealthy one.
+///
+/// `replayed` is null when the replay reached no verdict at all: an empty log, or a
+/// `state_changed` written before the target state was recorded.
+pub const DoctorFinding = struct {
+    short: []const u8,
+    title: []const u8,
+    verdict: doctor.Verdict,
+    recorded: model.Issue.State,
+    replayed: ?model.Issue.State = null,
+};
+
+pub const DoctorReport = struct {
+    /// Every issue in the project, including the clean ones the findings omit.
+    checked: usize,
+    findings: []const DoctorFinding,
 };
 
 pub const Container = struct {
@@ -411,6 +431,8 @@ pub const memory_review_apply = Method("memory.review.apply", BufferParams, Revi
 pub const gc_branches = Method("gc.branches", RepoParams, []const []const u8);
 pub const gc_runs = Method("gc.runs", RepoParams, []const GcRun);
 
+pub const doctor_check = Method("doctor.check", RepoParams, DoctorReport);
+
 /// Every method, so a test can assert the set is complete and the router can be built
 /// from data rather than from a chain of `std.mem.startsWith`.
 pub const all = .{
@@ -422,7 +444,7 @@ pub const all = .{
     issue_reopen,    issue_comment, issue_triage_load,  issue_triage_apply,
     run_list,        run_start,     run_end,            memory_stale,
     memory_list,     memory_new,    memory_review_load, memory_review_apply,
-    gc_branches,     gc_runs,
+    gc_branches,     gc_runs,       doctor_check,
 };
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,10 @@
     { self, nixpkgs }:
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
+      # Kept equal to build.zig.zon's by a test, which is the only thing that can: nix
+      # cannot read it without a regex over the file, and a wrong regex breaks the build
+      # rather than a check.
+      version = "0.1.0";
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
@@ -42,7 +46,7 @@
           # qemu or tuicr, so wrapping it there would only enlarge the image.
           capsule-unwrapped = pkgs.stdenv.mkDerivation {
             pname = "capsule-unwrapped";
-            version = "0.1.0";
+            inherit version;
             src = ./.;
 
             nativeBuildInputs = [ pkgs.zig_0_16 ];
@@ -62,7 +66,7 @@
           # rename of the Zig artifact turned into a buildEnv collision.
           capsule = pkgs.stdenvNoCC.mkDerivation {
             pname = "capsule";
-            version = "0.1.0";
+            inherit version;
             src = ./.;
 
             nativeBuildInputs = [ pkgs.makeWrapper ];

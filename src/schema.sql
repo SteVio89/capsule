@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS events (
   run_id     BLOB,
   actor      TEXT    NOT NULL,
   kind       TEXT    NOT NULL,
+  -- Where a `state_changed` event moved the issue; NULL for every other kind. Without
+  -- it a replay cannot reach a verdict on the working states, which is what made
+  -- `issues.state` unverifiable rather than merely uncached. NULL on a `state_changed`
+  -- means the row predates this column.
+  to_state   TEXT,
   payload    TEXT    NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 ) STRICT;

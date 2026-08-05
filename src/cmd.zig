@@ -259,6 +259,7 @@ pub fn run(ctx: *Ctx, cmd: *const cli.Command) u8 {
         if (std.mem.eql(u8, cmd.verb, "build")) return imageBuild(ctx);
     }
     if (std.mem.eql(u8, cmd.group, "login")) return login(ctx);
+    if (std.mem.eql(u8, cmd.group, "doctor")) return doctorCheck(ctx);
     if (std.mem.eql(u8, cmd.group, "run")) {
         if (std.mem.eql(u8, cmd.verb, "start")) return runStart(ctx);
         if (std.mem.eql(u8, cmd.verb, "attach")) return runAttach(ctx);
@@ -272,6 +273,49 @@ pub fn run(ctx: *Ctx, cmd: *const cli.Command) u8 {
     }
 
     return ctx.fail("'{s} {s}' is marked ported but has no handler", .{ cmd.group, cmd.verb });
+}
+
+/// `capsule doctor` — replay each issue's log and report where the cached state differs.
+///
+/// Exits non-zero only for a verdict that means the data is wrong. `unverifiable` says
+/// the log predates the `to_state` column, which is a fact about history rather than a
+/// fault, and failing a check over it would make the command useless on any older store.
+fn doctorCheck(ctx: *Ctx) u8 {
+    const p = ctx.repoParams();
+    const response = api.call(ctx.arena, ctx.io, ctx.socket, api.doctor_check, .{
+        .git_common_dir = p.git_common_dir,
+        .cwd = p.cwd,
+    }) catch |e| return ctx.fail("{t}", .{e});
+
+    const report = switch (response) {
+        .ok => |v| v,
+        .err => |f| return failure(ctx, f),
+    };
+    if (ctx.json) return emitJson(ctx, report);
+
+    if (report.findings.len == 0) {
+        ctx.out.print(
+            "{d} issue(s) checked — every one agrees with its event log\n",
+            .{report.checked},
+        ) catch {};
+        return 0;
+    }
+
+    ctx.out.print("{d} issue(s) checked, {d} to look at:\n\n", .{
+        report.checked, report.findings.len,
+    }) catch {};
+
+    var faulty = false;
+    for (report.findings) |f| {
+        if (f.verdict != .unverifiable) faulty = true;
+        ctx.out.print("  {s}  {s}\n", .{ f.short, f.title }) catch {};
+        ctx.out.print("    {s}: recorded {s}", .{ @tagName(f.verdict), @tagName(f.recorded) }) catch {};
+        if (f.replayed) |replayed| {
+            ctx.out.print(", the log replays to {s}", .{@tagName(replayed)}) catch {};
+        }
+        ctx.out.writeAll("\n") catch {};
+    }
+    return if (faulty) 1 else 0;
 }
 
 /// Prints the daemon's raw JSON when `--json` was passed. The bash CLI printed raw JSON
@@ -2911,7 +2955,7 @@ const handled = [_][2][]const u8{
     .{ "vm", "ssh" },        .{ "vm", "gc" },         .{ "image", "pull" },      .{ "run", "start" },
     .{ "run", "attach" },    .{ "vm", "start" },      .{ "vm", "stop" },         .{ "vm", "disk" },
     .{ "vm", "destroy" },    .{ "run", "end" },       .{ "run", "review" },      .{ "run", "reset" },
-    .{ "project", "rm" },    .{ "login", "" },        .{ "image", "build" },
+    .{ "project", "rm" },    .{ "login", "" },        .{ "image", "build" },     .{ "doctor", "" },
 };
 
 test "a run directory is recovered from its container name by the prefix, not by bytes" {

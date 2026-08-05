@@ -208,9 +208,9 @@ pub fn writeInitialize(w: *std.Io.Writer, id: ?std.json.Value, protocol_version:
     try writeId(w, id);
     try w.writeAll(",\"result\":{\"protocolVersion\":");
     try std.json.Stringify.encodeJsonString(protocol_version, .{}, w);
-    try w.writeAll(
-        ",\"capabilities\":{\"tools\":{}}," ++
-            "\"serverInfo\":{\"name\":\"capsule\",\"version\":\"0.1.0\"}}}",
+    try w.print(
+        ",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"capsule\",\"version\":\"{s}\"}}}}}}",
+        .{@import("build_options").version},
     );
 }
 

@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !u8 {
     var taken: usize = 0;
 
     if (std.mem.eql(u8, command, "version")) {
-        try out.interface.writeAll("capsule 0.1.0\n");
+        try out.interface.print("capsule {s}\n", .{capsule.version});
         return 0;
     }
 

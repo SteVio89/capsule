@@ -77,6 +77,7 @@ pub const groups = [_]Group{
     .{ .name = "run", .summary = "hand work to an agent and take it back" },
     .{ .name = "daemon", .summary = "the host service everything else reads from" },
     .{ .name = "board", .summary = "the dashboard" },
+    .{ .name = "doctor", .summary = "check this project's issues against the event log" },
     .{ .name = "login", .summary = "authenticate the agent CLI for a profile" },
 };
 
@@ -136,6 +137,7 @@ pub const commands = [_]Command{
     .{ .group = "daemon", .verb = "status", .summary = "whether it is up, and what it is holding", .needs = .{ .host = true }, .ported = true },
 
     .{ .group = "board", .summary = "VM, issues, memory and waiting branches — read-only", .needs = .{ .host = true, .daemon = true }, .ported = true },
+    .{ .group = "doctor", .summary = "replay every issue's log and report where the cached state disagrees", .needs = .{ .host = true, .daemon = true }, .ported = true },
     .{ .group = "login", .args = "[profile]", .summary = "a container to authenticate the agent CLI in", .needs = .{ .host = true, .vm = true }, .ported = true },
 };
 
@@ -383,6 +385,7 @@ test "the guard matrix matches the one the bash CLI enforced" {
         .{ .group = "issue", .verb = "triage", .needs = .{ .host = true, .daemon = true } },
         .{ .group = "memory", .verb = "review", .needs = .{ .host = true, .daemon = true } },
         .{ .group = "board", .verb = "", .needs = .{ .host = true, .daemon = true } },
+        .{ .group = "doctor", .verb = "", .needs = .{ .host = true, .daemon = true } },
         .{ .group = "env", .verb = "init", .needs = .{ .host = true } },
         .{ .group = "run", .verb = "start", .needs = .{ .host = true, .daemon = true, .vm = true } },
         .{ .group = "run", .verb = "attach", .needs = .{ .host = true, .daemon = true, .vm = true } },

@@ -1,9 +1,31 @@
 //! capsuled's core: everything the daemon, the client, and the board share.
 
+pub const version = @import("build_options").version;
+
+test "the flake declares the same version the binary prints, exactly once" {
+    // `build.zig.zon` is the source of truth and the Zig side now reads it, but nix
+    // cannot, so the flake carries its own copy. This is what keeps the copy honest —
+    // and catches a second one being reintroduced beside it.
+    const std = @import("std");
+    const flake_source = @embedFile("flake_nix");
+    var buf: [64]u8 = undefined;
+    const declared = try std.fmt.bufPrint(&buf, "version = \"{s}\";", .{version});
+
+    var seen: usize = 0;
+    var rest: []const u8 = flake_source;
+    while (std.mem.indexOf(u8, rest, "version = \"")) |at| {
+        seen += 1;
+        try std.testing.expect(std.mem.startsWith(u8, rest[at..], declared));
+        rest = rest[at + declared.len ..];
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+}
+
 pub const id = @import("id.zig");
 pub const config = @import("config.zig");
 pub const model = @import("model.zig");
 pub const replay = @import("replay.zig");
+pub const doctor = @import("doctor.zig");
 pub const protocol = @import("protocol.zig");
 pub const api = @import("api.zig");
 pub const exec = @import("exec.zig");

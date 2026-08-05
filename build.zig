@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// The one version. `build.zig.zon` is where a release bumps it; everything that prints
+/// a version reads it from here so a bump cannot land in one place and not the other.
+const version = @import("build.zig.zon").version;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -16,7 +20,15 @@ pub fn build(b: *std.Build) void {
     // The shipped example config is the compatibility contract for the config parser, so
     // it is embedded and asserted on rather than duplicated into a test fixture that
     // could drift from the file users actually copy.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
+    core.addOptions("build_options", options);
+
     core.addAnonymousImport("config_example", .{ .root_source_file = b.path("config.example") });
+
+    // Embedded only so a test can assert the flake declares the same version this binary
+    // prints. Nothing reads it at run time.
+    core.addAnonymousImport("flake_nix", .{ .root_source_file = b.path("flake.nix") });
 
     // `env init`'s scaffolding. Embedded rather than read from CAPSULE_SHARE at run time,
     // so a language that lost a file breaks the build instead of the user's first command.

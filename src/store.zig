@@ -38,6 +38,12 @@ pub const Store = struct {
 
         var s = Store{ .db = db };
         try s.execScript(schema);
+        // `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a column added
+        // to `schema.sql` never reaches a database that already exists. Losing a backlog
+        // to gain a column is not a trade worth offering, so this one statement is the
+        // exception to the drop-and-recreate policy. On a fresh database the column is
+        // already there and the statement fails as a duplicate — the expected outcome.
+        s.execScript("ALTER TABLE events ADD COLUMN to_state TEXT;") catch {};
         return s;
     }
 
@@ -267,6 +273,9 @@ pub const Store = struct {
         /// Set only when the event happened inside a run, which is what distinguishes an
         /// agent's comment from one typed on the host.
         run_id: ?Id,
+        /// Where a `state_changed` moved the issue. Null for other kinds, and also for a
+        /// `state_changed` written before the column existed — those cannot be replayed.
+        to: ?model.Issue.State,
     };
 
     const EventColumns = struct {
@@ -276,6 +285,7 @@ pub const Store = struct {
         payload: []const u8,
         created_at: i64,
         run_id: ?Id,
+        to_state: ?[]const u8,
     };
 
     /// An issue's events, oldest first.
@@ -289,7 +299,7 @@ pub const Store = struct {
     /// without trusting a clock that two writers might disagree about.
     pub fn listEvents(s: *Store, arena: std.mem.Allocator, issue_id: Id) ![]EventRow {
         var stmt = try s.db.prepare(
-            "SELECT id, kind, actor, payload, created_at, run_id FROM events " ++
+            "SELECT id, kind, actor, payload, created_at, run_id, to_state FROM events " ++
                 "WHERE issue_id = ? ORDER BY id;",
         );
         defer stmt.deinit();
@@ -303,8 +313,17 @@ pub const Store = struct {
             .payload = row.payload,
             .created_at = row.created_at,
             .run_id = row.run_id,
+            .to = if (row.to_state) |t| std.meta.stringToEnum(model.Issue.State, t) else null,
         };
         return rows;
+    }
+
+    /// Just the ids, for resolving a short prefix. `listIssues` carries every title and
+    /// body with it, which is a lot of bytes to move to match eight hex characters.
+    pub fn listIssueIds(s: *Store, arena: std.mem.Allocator, project_id: Id) ![]Id {
+        var stmt = try s.db.prepare("SELECT id FROM issues WHERE project_id = ? ORDER BY id;");
+        defer stmt.deinit();
+        return stmt.all(Id, arena, .{}, .{blob(&project_id)});
     }
 
     /// `state_filter` of null means every state. Ordered by id, which is UUIDv7, so this
@@ -451,8 +470,10 @@ pub const Store = struct {
         now_ms: i64,
     ) !void {
         const run: ?sqlite.Blob = if (run_id) |*r| blob(r) else null;
+        const to_state: ?[]const u8 = if (event.to) |to| @tagName(to) else null;
         try s.db.exec(
-            "INSERT INTO events(id, issue_id, run_id, actor, kind, payload, created_at) VALUES(?,?,?,?,?,?,?);",
+            "INSERT INTO events(id, issue_id, run_id, actor, kind, to_state, payload, created_at) " ++
+                "VALUES(?,?,?,?,?,?,?,?);",
             .{},
             .{
                 blob(&event_id),
@@ -460,6 +481,7 @@ pub const Store = struct {
                 run,
                 @tagName(event.actor),
                 @tagName(event.kind),
+                to_state,
                 payload,
                 now_ms,
             },
@@ -551,40 +573,46 @@ pub const Store = struct {
     };
 
     /// Every live run, which is exactly the set a token can resolve against.
-    pub fn activeRuns(s: *Store, arena: std.mem.Allocator) ![]ActiveRun {
-        var stmt = try s.db.prepare(
-            "SELECT id, issue_id, project_id, branch, token_hash FROM runs " ++
-                "WHERE state = 'active' AND token_hash IS NOT NULL ORDER BY id;",
-        );
-        defer stmt.deinit();
+    const ActiveRunColumns = struct {
+        run_id: Id,
+        issue_id: Id,
+        project_id: Id,
+        branch: []const u8,
+        token_hash: sqlite.Blob,
+    };
 
-        const columns = try stmt.all(struct {
-            run_id: Id,
-            issue_id: Id,
-            project_id: Id,
-            branch: []const u8,
-            token_hash: sqlite.Blob,
-        }, arena, .{}, .{});
+    const active_run_select = "SELECT id, issue_id, project_id, branch, token_hash FROM runs " ++
+        "WHERE state = 'active' AND token_hash IS NOT NULL";
 
-        const rows = try arena.alloc(ActiveRun, columns.len);
-        for (columns, rows) |row, *out| out.* = .{
+    fn activeRunFrom(row: ActiveRunColumns) ActiveRun {
+        return .{
             .run_id = row.run_id,
             .issue_id = row.issue_id,
             .project_id = row.project_id,
             .branch = row.branch,
             .token_hash = row.token_hash.data,
         };
+    }
+
+    pub fn activeRuns(s: *Store, arena: std.mem.Allocator) ![]ActiveRun {
+        var stmt = try s.db.prepare(active_run_select ++ " ORDER BY id;");
+        defer stmt.deinit();
+
+        const columns = try stmt.all(ActiveRunColumns, arena, .{}, .{});
+        const rows = try arena.alloc(ActiveRun, columns.len);
+        for (columns, rows) |row, *out| out.* = activeRunFrom(row);
         return rows;
     }
 
     /// The refusal rule for `run start`: one run per project at a time, because the
     /// replica keeps one working tree.
     pub fn activeRunForProject(s: *Store, arena: std.mem.Allocator, project_id: Id) !?ActiveRun {
-        const all = try s.activeRuns(arena);
-        for (all) |run| {
-            if (std.mem.eql(u8, &run.project_id, &project_id)) return run;
-        }
-        return null;
+        var stmt = try s.db.prepare(active_run_select ++ " AND project_id = ? ORDER BY id LIMIT 1;");
+        defer stmt.deinit();
+
+        const columns = try stmt.all(ActiveRunColumns, arena, .{}, .{blob(&project_id)});
+        if (columns.len == 0) return null;
+        return activeRunFrom(columns[0]);
     }
 
     /// The project's most recent runs, newest first (descending UUIDv7 id), at most
@@ -627,17 +655,17 @@ pub const Store = struct {
         now_ms: i64,
     ) !usize {
         const active = try s.activeRuns(arena);
+
+        // Built once rather than scanned per run: this runs every poll tick, and the
+        // pairwise scan it replaces was the product of two lists that both grow.
+        var live: std.StringHashMapUnmanaged(void) = .empty;
+        try live.ensureTotalCapacity(arena, @intCast(live_container_names.len));
+        for (live_container_names) |name| live.putAssumeCapacity(name, {});
+
         var abandoned: usize = 0;
         for (active) |run| {
-            const name = try containerName(arena, run.run_id);
-            var found = false;
-            for (live_container_names) |live| {
-                if (std.mem.eql(u8, live, name)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (found) continue;
+            var buf: [container_name_len]u8 = undefined;
+            if (live.contains(containerNameBuf(&buf, run.run_id))) continue;
             try s.finishRun(run.run_id, .abandoned, now_ms);
             abandoned += 1;
         }
@@ -757,8 +785,18 @@ pub const Store = struct {
 
 /// Derivable in both directions without a lookup table, so the world-model poll can map
 /// `podman ps` output straight onto runs.
+pub const container_name_len = "capsule-".len + 12;
+
+/// The container name for a run, written into `buf`. Fixed length, so the poll loop can
+/// name every active run without allocating.
+pub fn containerNameBuf(buf: *[container_name_len]u8, run_id: Id) []const u8 {
+    // The buffer is exactly the length of the output, so this cannot fail.
+    return std.fmt.bufPrint(buf, "capsule-{s}", .{ids.toHex(run_id)[0..12]}) catch unreachable;
+}
+
 pub fn containerName(arena: std.mem.Allocator, run_id: Id) ![]const u8 {
-    return std.fmt.allocPrint(arena, "capsule-{s}", .{ids.toHex(run_id)[0..12]});
+    var buf: [container_name_len]u8 = undefined;
+    return arena.dupe(u8, containerNameBuf(&buf, run_id));
 }
 
 const testing = std.testing;
@@ -873,6 +911,38 @@ test "a comment is recorded without moving the issue" {
     );
     try testing.expectEqual(model.Issue.State.open, next);
     try testing.expectEqual(@as(i64, 2), try s.countEvents(issue));
+}
+
+test "a state_changed round-trips its target through sqlite, so the log replays" {
+    // The pure replay tests build rows by hand; this is the only thing that proves the
+    // target survives the INSERT and comes back as the same enum.
+    var s = try freshStore();
+    defer s.close();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const pid = seeded(1);
+    const issue = seeded(10);
+    try s.addProject(pid, "/p", "default", 1000);
+    _ = try s.createIssue(issue, pid, "t", "b", .human, seeded(11), 1001);
+    _ = try s.appendEvent(seeded(12), issue, null, .{
+        .kind = .state_changed,
+        .actor = .agent,
+        .to = .in_progress,
+    }, "", 1002);
+    _ = try s.appendEvent(seeded(13), issue, null, .{ .kind = .commented, .actor = .human }, "hi", 1003);
+
+    const events = try s.listEvents(a.allocator(), issue);
+    try testing.expectEqual(model.Issue.State.in_progress, events[1].to.?);
+    // Only `state_changed` carries one; the others must come back null, not defaulted.
+    try testing.expectEqual(@as(?model.Issue.State, null), events[0].to);
+    try testing.expectEqual(@as(?model.Issue.State, null), events[2].to);
+
+    try testing.expectEqual(model.Issue.State.in_progress, replay.fold(&.{
+        .{ .kind = events[0].kind, .actor = events[0].actor, .to = events[0].to },
+        .{ .kind = events[1].kind, .actor = events[1].actor, .to = events[1].to },
+        .{ .kind = events[2].kind, .actor = events[2].actor, .to = events[2].to },
+    }).?);
 }
 
 test "the event log reads back as the history it recorded" {
@@ -1106,6 +1176,57 @@ test "an active run is findable by project, and only one exists" {
     const live = (try s.activeRunForProject(a.allocator(), ctx.project)).?;
     try testing.expectEqual(seeded(30), live.run_id);
     try testing.expectEqualStrings("capsule/abc", live.branch);
+}
+
+test "an active run belongs to its own project, not to whichever started first" {
+    // The lookup filters in SQL now. A dropped or mis-bound WHERE would hand one project
+    // the other's run, and `run start` refuses on exactly this answer.
+    var s = try freshStore();
+    defer s.close();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const mine = seeded(1);
+    const theirs = seeded(2);
+    try s.addProject(mine, "/mine", "default", 1000);
+    try s.addProject(theirs, "/theirs", "default", 1000);
+    const my_issue = seeded(10);
+    const their_issue = seeded(20);
+    _ = try s.createIssue(my_issue, mine, "t", "b", .human, seeded(11), 1001);
+    _ = try s.createIssue(their_issue, theirs, "t", "b", .human, seeded(21), 1001);
+
+    try s.startRun(seeded(30), their_issue, theirs, "capsule/theirs", "h", seeded(31), 1002);
+    try testing.expectEqual(
+        @as(?Store.ActiveRun, null),
+        try s.activeRunForProject(a.allocator(), mine),
+    );
+
+    try s.startRun(seeded(40), my_issue, mine, "capsule/mine", "h", seeded(41), 1003);
+    try testing.expectEqualStrings("capsule/mine", (try s.activeRunForProject(a.allocator(), mine)).?.branch);
+    try testing.expectEqualStrings("capsule/theirs", (try s.activeRunForProject(a.allocator(), theirs)).?.branch);
+}
+
+test "the id-only listing is the same set, in the same order, as the full one" {
+    // Prefix resolution indexes into this list and then fetches that one row, so a
+    // different order or a different set would resolve a prefix to the wrong issue.
+    var s = try freshStore();
+    defer s.close();
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const mine = seeded(1);
+    const theirs = seeded(2);
+    try s.addProject(mine, "/mine", "default", 1000);
+    try s.addProject(theirs, "/theirs", "default", 1000);
+    _ = try s.createIssue(seeded(12), mine, "b", "", .human, seeded(13), 1002);
+    _ = try s.createIssue(seeded(10), mine, "a", "", .human, seeded(11), 1001);
+    _ = try s.createIssue(seeded(20), theirs, "other", "", .human, seeded(21), 1003);
+
+    const rows = try s.listIssues(a.allocator(), mine, null);
+    const only_ids = try s.listIssueIds(a.allocator(), mine);
+    try testing.expectEqual(rows.len, only_ids.len);
+    for (rows, only_ids) |row, id| try testing.expectEqual(row.id, id);
+    try testing.expectEqual(@as(usize, 2), only_ids.len);
 }
 
 test "ending a run revokes its token by removing it from the active set" {

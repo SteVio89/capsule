@@ -51,13 +51,6 @@ pub const Snapshot = struct {
     image_digest: ?[]const u8 = null,
     containers: []const Container = &.{},
     branches: []const Branch = &.{},
-
-    /// Frees the container and branch slices and resets to the unreachable default.
-    pub fn deinit(s: *Snapshot, gpa: std.mem.Allocator) void {
-        gpa.free(s.containers);
-        gpa.free(s.branches);
-        s.* = .{};
-    }
 };
 
 /// Unknown keys and malformed lines are skipped rather than failing the whole probe: a
