@@ -106,11 +106,6 @@ fn handInteractive(ctx: *Ctx, argv: []const []const u8) exec.Error!u8 {
     return exec.interactive(ctx.io, argv, .{});
 }
 
-fn handCapture(ctx: *Ctx, argv: []const []const u8) exec.Error!exec.Output {
-    ctx.flush();
-    return exec.interactiveCapture(ctx.arena, ctx.io, argv, .{});
-}
-
 /// Why a command was refused before it ran. Each maps to one message, in one place —
 /// which is what stops "run capsule daemon start" being spelled six different ways.
 pub const Refusal = enum {
@@ -1563,10 +1558,31 @@ fn runEnd(ctx: *Ctx) u8 {
     return 0;
 }
 
+/// The subset of `tuicr review list`'s JSON capsule reads. Its shape is tuicr's, not ours.
+const ReviewSession = struct {
+    slug: []const u8,
+    kind: []const u8,
+    updated_at: []const u8,
+};
+
+/// One comment out of a session. `location` is tuicr's own rendering of the anchor, which
+/// is why the line numbers beside it in the same object are left alone.
+const ReviewComment = struct {
+    location: []const u8,
+    content: []const u8,
+};
+
 /// `run review` — read the agent's branch, and hand your comments back to the issue.
 ///
 /// Without `tuicr`, or with stdout redirected, this degrades to `git log -p`. That is not
 /// a fallback for missing software so much as the scripted form of the same question.
+///
+/// tuicr gets the whole terminal, and the comments are read back from disk afterwards.
+/// Spawning it with stdout on a pipe — to catch what `--stdout` prints on `y` — is what
+/// crossterm cannot survive: it builds its input source once at startup and discards the
+/// error with `.ok()`, so every later keystroke reports `Failed to initialize input
+/// reader` instead of the real cause. Reading the session tuicr persists needs no terminal
+/// at all, which is what keeps the handover and the data path off the same channel.
 fn runReview(ctx: *Ctx) u8 {
     const id = issueTarget(ctx, if (ctx.args.len > 0) ctx.args[0] else null, ready_only) orelse return 1;
     const p = ctx.repoParams();
@@ -1599,19 +1615,41 @@ fn runReview(ctx: *Ctx) u8 {
         return code;
     }
 
-    const review = handCapture(ctx, &.{
-        "tuicr", "--no-update-check", "--stdout", "-r", range,
+    // tuicr exits 0 even when it fails to start, so its status cannot say whether the
+    // review happened. The stamp can: it is written when a session is opened, so a newest
+    // session that comes back untouched is an earlier review of some other issue, and its
+    // comments must not be offered for this one.
+    const before = reviewSession(ctx, p.cwd);
+
+    _ = handInteractive(ctx, &.{
+        "tuicr", "--no-update-check", "-r", range,
     }) catch |e| return ctx.fail("tuicr failed: {t}", .{e});
 
-    const exported = std.mem.trim(u8, review.stdout, " \t\r\n");
-    if (exported.len == 0) {
-        ctx.out.writeAll("no comments exported — press y in tuicr to hand them back to the issue\n") catch {};
-        return 0;
+    const session = reviewSession(ctx, p.cwd) orelse
+        return ctx.fail("tuicr recorded no review session for this checkout", .{});
+    if (before) |b| {
+        if (std.mem.eql(u8, b.slug, session.slug) and
+            std.mem.eql(u8, b.updated_at, session.updated_at))
+        {
+            return ctx.fail("tuicr left no review behind — did it start?", .{});
+        }
     }
 
-    ctx.out.print("{s}\n\n", .{exported}) catch {};
+    const comments = reviewComments(ctx, p.cwd, session.slug) orelse
+        return ctx.fail("could not read the comments in {s}", .{session.slug});
+
+    if (comments.len == 0) {
+        ctx.out.writeAll("no comments — nothing to attach\n") catch {};
+        return 0;
+    }
+    const text = reviewText(ctx.arena, comments) orelse return 1;
+
+    // The slug is printed because capsule picks the session by recency rather than being
+    // told which one tuicr opened: naming it is what makes the guess checkable before the
+    // comments land on an issue they may not belong to.
+    ctx.out.print("{s}\n\n{s}\n", .{ session.slug, text }) catch {};
     if (!confirm(ctx, "attach to the issue for the agent's next run?")) {
-        ctx.out.writeAll("not attached\n") catch {};
+        ctx.out.writeAll("not attached — the comments stay in tuicr's session\n") catch {};
         return 0;
     }
 
@@ -1619,13 +1657,63 @@ fn runReview(ctx: *Ctx) u8 {
         .git_common_dir = p.git_common_dir,
         .cwd = p.cwd,
         .id = issue.id,
-        .text = exported,
+        .text = text,
     }) catch |e| return ctx.fail("{t}", .{e});
     switch (commented) {
         .ok => ctx.out.writeAll("attached\n") catch {},
         .err => |f| return failure(ctx, f),
     }
     return 0;
+}
+
+/// The review session tuicr just wrote for this checkout, or null when it wrote none.
+///
+/// tuicr stamps `updated_at` when it opens a session, not only when a comment is added, so
+/// the newest one is the review that just ended even if it ended with nothing said. The
+/// timestamps are RFC 3339 at a fixed width and always UTC, which is what lets them be
+/// ordered as bytes; `kind` separates local sessions from the ones a forge PR produces.
+fn reviewSession(ctx: *Ctx, repo: []const u8) ?ReviewSession {
+    const listed = exec.capture(ctx.arena, ctx.io, &.{
+        "tuicr", "review", "list", "--repo", repo,
+    }, .{}) catch return null;
+
+    const sessions = std.json.parseFromSliceLeaky([]ReviewSession, ctx.arena, listed, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return null;
+
+    var newest: ?ReviewSession = null;
+    for (sessions) |s| {
+        if (!std.mem.eql(u8, s.kind, "local")) continue;
+        if (newest) |n| if (std.mem.order(u8, s.updated_at, n.updated_at) != .gt) continue;
+        newest = s;
+    }
+    return newest;
+}
+
+/// The comments stored in one session, in the order tuicr kept them.
+fn reviewComments(ctx: *Ctx, repo: []const u8, slug: []const u8) ?[]ReviewComment {
+    const out = exec.capture(ctx.arena, ctx.io, &.{
+        "tuicr", "review", "comments", "--repo", repo, "--session", slug,
+    }, .{}) catch return null;
+
+    return std.json.parseFromSliceLeaky([]ReviewComment, ctx.arena, out, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch null;
+}
+
+/// The comments as one block of text — what the issue stores and the agent reads next run.
+fn reviewText(arena: std.mem.Allocator, comments: []const ReviewComment) ?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var alloc = Writer.Allocating.fromArrayList(arena, &out);
+    const w = &alloc.writer;
+
+    for (comments, 0..) |c, i| {
+        if (i > 0) w.writeByte('\n') catch return null;
+        w.print("{s}\n{s}\n", .{ c.location, c.content }) catch return null;
+    }
+    return alloc.written();
 }
 
 /// The container of this project's live run, if there is one.
@@ -3081,4 +3169,68 @@ test "a command marked ported has a handler, and one that is not says so" {
             return error.PortedWithoutHandler;
         }
     }
+}
+
+test "tuicr's session listing parses, and the newest local session wins" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Verbatim from `tuicr review list`, trimmed to the fields capsule reads plus one it
+    // ignores, so a renamed field fails here rather than at a review the user just typed.
+    const listing =
+        \\[
+        \\  {"slug":"o/r@main/commits/aaa..aaa","kind":"local",
+        \\   "updated_at":"2026-08-05T17:55:01.038699+00:00","comment_count":0},
+        \\  {"slug":"o/r@main/unstaged/bbb","kind":"local",
+        \\   "updated_at":"2026-08-04T15:10:13.042963+00:00","comment_count":1},
+        \\  {"slug":"o/r/7","kind":"pr",
+        \\   "updated_at":"2026-08-06T09:00:00.000000+00:00","comment_count":3}
+        \\]
+    ;
+
+    const sessions = try std.json.parseFromSliceLeaky([]ReviewSession, a, listing, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    try testing.expectEqual(@as(usize, 3), sessions.len);
+
+    var newest: ?ReviewSession = null;
+    for (sessions) |s| {
+        if (!std.mem.eql(u8, s.kind, "local")) continue;
+        if (newest) |n| if (std.mem.order(u8, s.updated_at, n.updated_at) != .gt) continue;
+        newest = s;
+    }
+    // The PR session is the newest of all three, and is still not the one chosen.
+    try testing.expectEqualStrings("o/r@main/commits/aaa..aaa", newest.?.slug);
+}
+
+test "comments become one block, each anchored by tuicr's own location string" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const stored =
+        \\[
+        \\  {"location":"src/api.zig:55","path":"src/api.zig","start_line":55,
+        \\   "content":"what is this replica used for"},
+        \\  {"location":"src/cmd.zig:12-14","path":"src/cmd.zig","start_line":12,
+        \\   "content":"two lines\nof note"}
+        \\]
+    ;
+
+    const comments = try std.json.parseFromSliceLeaky([]ReviewComment, a, stored, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+
+    try testing.expectEqualStrings(
+        \\src/api.zig:55
+        \\what is this replica used for
+        \\
+        \\src/cmd.zig:12-14
+        \\two lines
+        \\of note
+        \\
+    , reviewText(a, comments).?);
 }

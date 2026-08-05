@@ -319,11 +319,12 @@ every project with it.
 `run review` opens the branch in [tuicr](https://tuicr.dev) — the whole diff as one
 PR-style buffer, with inline comments. Reviewing a revision range needs no GitHub
 and no shared remote, so it works on the replica's branches as-is. When the work
-isn't ready to merge, leave comments and press `y`: on exit, capsule shows what
-you exported and offers to attach it to the issue, where the agent sees it on its
-next run. Attaching is a confirmed step, never implicit — quitting without
-exporting changes nothing. Without tuicr on `PATH` (or with stdout redirected)
-the command falls back to `git log -p`.
+isn't ready to merge, leave comments and quit — there is nothing to export. tuicr
+persists every review under a session name, so capsule reads the comments back from
+there, prints them under that name, and offers to attach them to the issue, where the
+agent sees them on its next run. Attaching is a confirmed step, never implicit, and
+declining leaves the comments in the session rather than dropping them. Without tuicr
+on `PATH` (or with stdout redirected) the command falls back to `git log -p`.
 
 The merge is a squash, not `--no-ff`: one commit with a message you author lands
 on your branch, and the agent's granular commits stay out of your history.

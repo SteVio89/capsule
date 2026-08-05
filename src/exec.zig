@@ -13,7 +13,11 @@
 //!   - `stream`       — inherit the terminal. For output the user should watch scroll by.
 //!   - `interactive`  — hand over `/dev/tty`. For programs that take over the screen.
 //!   - `runWithInput` — feed the child a file on stdin. For shipping bytes to the VM.
-//!   - `interactiveCapture` — both at once: draws on the terminal, output is data.
+//!
+//! There is deliberately no "draws on the terminal, output is data" shape. `run review`
+//! wanted one and it does not work: a TUI handed a pipe for stdout cannot initialise its
+//! input source, so the program starts and then refuses every keystroke. A program that
+//! takes the screen gets all three descriptors, and its output is read back some other way.
 
 const std = @import("std");
 const Io = std.Io;
@@ -183,51 +187,6 @@ pub fn runWithInput(
         .stdin = .{ .file = input },
         .stdout = .pipe,
         .stderr = .inherit,
-    }) catch return error.SpawnFailed;
-    defer child.kill(io);
-
-    var buf: [4096]u8 = undefined;
-    var reader = child.stdout.?.readerStreaming(io, &buf);
-    const stdout = reader.interface.allocRemaining(gpa, options.stdout_limit) catch
-        return error.SpawnFailed;
-    errdefer gpa.free(stdout);
-
-    const term = child.wait(io) catch return error.SpawnFailed;
-    return switch (term) {
-        .exited => |code| .{ .code = code, .stdout = stdout, .stderr = &.{} },
-        else => {
-            gpa.free(stdout);
-            return error.Signalled;
-        },
-    };
-}
-
-/// Hands the terminal to a program that draws on it, while capturing what it writes to
-/// stdout. `tuicr` is the case: it reviews a diff on the screen and prints the comments it
-/// exported, and both have to happen at once.
-///
-/// stdin and stderr go to `/dev/tty` for the same reason `interactive` opens it — capsule's
-/// own stdio is frequently a pipe — while stdout is a pipe this side drains. Draining as
-/// the child runs rather than after it exits is what keeps a large export from filling the
-/// pipe buffer and stalling both processes.
-pub fn interactiveCapture(
-    gpa: std.mem.Allocator,
-    io: Io,
-    argv: []const []const u8,
-    options: Options,
-) Error!Output {
-    const tty = openTty(io);
-    defer if (tty) |t| t.close(io);
-
-    const stdio: std.process.SpawnOptions.StdIo = if (tty) |t| .{ .file = t } else .inherit;
-
-    var child = std.process.spawn(io, .{
-        .argv = argv,
-        .cwd = if (options.cwd) |c| .{ .path = c } else .inherit,
-        .environ_map = options.environ,
-        .stdin = stdio,
-        .stdout = .pipe,
-        .stderr = stdio,
     }) catch return error.SpawnFailed;
     defer child.kill(io);
 
