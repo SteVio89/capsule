@@ -81,7 +81,7 @@ pub const Ctx = struct {
 
 /// The terminal handovers, each flushing first. They exist so that "flush before you hand
 /// over" is a property of the call rather than a thing to remember at ten call sites.
-fn handSshInteractive(ctx: *Ctx, remote: []const u8) exec.Error!u8 {
+fn handSshInteractive(ctx: *Ctx, remote: []const u8) exec.Error!exec.Exit {
     ctx.flush();
     return ssh.interactive(ctx.arena, ctx.io, ctx.sshConfig(), remote);
 }
@@ -101,9 +101,51 @@ fn handStream(ctx: *Ctx, argv: []const []const u8) exec.Error!u8 {
     return exec.stream(ctx.io, argv, .{});
 }
 
-fn handInteractive(ctx: *Ctx, argv: []const []const u8) exec.Error!u8 {
+fn handInteractive(ctx: *Ctx, argv: []const []const u8) exec.Error!exec.Exit {
     ctx.flush();
     return exec.interactive(ctx.io, argv, .{});
+}
+
+/// A `Git` that can reach the replica.
+///
+/// The plain form is right for everything local. This one is for the four commands that
+/// talk to the VM, because git spawns its own ssh for an `ssh://` remote and would
+/// otherwise use none of capsule's options. A config capsule cannot render leaves
+/// `ssh_command` null, which is the old behaviour rather than a refusal to run.
+fn vmGit(ctx: *Ctx) git.Git {
+    return .{
+        .arena = ctx.arena,
+        .io = ctx.io,
+        .ssh_command = ssh.commandLine(ctx.arena, ctx.io, ctx.sshConfig()) catch null,
+    };
+}
+
+/// `handInteractive` for a child that trusts the descriptors it is handed rather than
+/// opening the terminal itself.
+///
+/// The shell CLI ran `tuicr` this way and it worked; both Zig ports opened a `/dev/tty`
+/// for it instead, and it wedged holding the terminal. `$EDITOR` and `ssh -t` do not care,
+/// which is why this is the exception rather than the default.
+fn handInherited(ctx: *Ctx, argv: []const []const u8) exec.Error!exec.Exit {
+    ctx.flush();
+    return exec.interactive(ctx.io, argv, .{ .terminal = .inherited });
+}
+
+/// Turns a handover that did not end in a normal exit into capsule's own failure message.
+///
+/// Null when the child exited, however it exited: a non-zero status is the command's own
+/// business. Only a signal is capsule's, because the program it handed the terminal to
+/// never got to say anything itself.
+fn handoverFailure(ctx: *Ctx, what: []const u8, ended: exec.Exit) ?u8 {
+    var buf: [16]u8 = undefined;
+    return switch (ended) {
+        .exited => null,
+        .signalled => |s| ctx.fail("{s} was killed by SIG{s}", .{ what, exec.Exit.signalName(s, &buf) }),
+        .stopped => |s| ctx.fail(
+            "{s} was stopped by SIG{s} — it held the terminal without running, so capsule killed it",
+            .{ what, exec.Exit.signalName(s, &buf) },
+        ),
+    };
 }
 
 /// Why a command was refused before it ran. Each maps to one message, in one place —
@@ -763,7 +805,7 @@ fn runList(ctx: *Ctx) u8 {
 }
 
 fn runFetch(ctx: *Ctx) u8 {
-    const g = git.Git{ .arena = ctx.arena, .io = ctx.io };
+    const g = vmGit(ctx);
     const out = git.fetch(g) catch |e| return ctx.fail("{t}", .{e});
     if (!out.ok()) return ctx.fail("git fetch failed: {s}", .{out.trimmedErr()});
     ctx.out.writeAll("fetched\n") catch {};
@@ -792,7 +834,7 @@ fn runPush(ctx: *Ctx) u8 {
     };
 
     const branch = git.issueBranch(ctx.arena, issue.id) catch return 1;
-    const g = git.Git{ .arena = ctx.arena, .io = ctx.io };
+    const g = vmGit(ctx);
     const out = git.pushToBranch(g, branch) catch |e| return ctx.fail("{t}", .{e});
     if (!out.ok()) return ctx.fail("git push failed: {s}", .{out.trimmedErr()});
 
@@ -811,7 +853,7 @@ fn runPush(ctx: *Ctx) u8 {
 fn runMerge(ctx: *Ctx) u8 {
     const id = issueTarget(ctx, if (ctx.args.len > 0) ctx.args[0] else null, ready_only) orelse return 1;
     const p = ctx.repoParams();
-    const g = git.Git{ .arena = ctx.arena, .io = ctx.io };
+    const g = vmGit(ctx);
 
     const got = api.call(ctx.arena, ctx.io, ctx.socket, api.issue_get, .{
         .git_common_dir = p.git_common_dir,
@@ -1289,8 +1331,9 @@ fn runAttach(ctx: *Ctx) u8 {
     // A session that ended rather than detached exits non-zero, and that is not a failure
     // of the command — it is the normal way a run finishes. bash needed an explicit
     // `|| true` here to stop `set -e` taking the script down before it could say so.
-    _ = handSshInteractive(ctx, cmd) catch |e|
+    const attached = handSshInteractive(ctx, cmd) catch |e|
         return ctx.fail("ssh failed: {t}", .{e});
+    if (handoverFailure(ctx, "ssh", attached)) |code| return code;
 
     const still_there = std.fmt.allocPrint(ctx.arena, "podman container exists {s}", .{
         ssh.shellQuote(ctx.arena, container) catch return 1,
@@ -1586,7 +1629,7 @@ const ReviewComment = struct {
 fn runReview(ctx: *Ctx) u8 {
     const id = issueTarget(ctx, if (ctx.args.len > 0) ctx.args[0] else null, ready_only) orelse return 1;
     const p = ctx.repoParams();
-    const g = git.Git{ .arena = ctx.arena, .io = ctx.io };
+    const g = vmGit(ctx);
 
     const got = api.call(ctx.arena, ctx.io, ctx.socket, api.issue_get, .{
         .git_common_dir = p.git_common_dir,
@@ -1621,9 +1664,10 @@ fn runReview(ctx: *Ctx) u8 {
     // comments must not be offered for this one.
     const before = reviewSession(ctx, p.cwd);
 
-    _ = handInteractive(ctx, &.{
+    const reviewed = handInherited(ctx, &.{
         "tuicr", "--no-update-check", "-r", range,
     }) catch |e| return ctx.fail("tuicr failed: {t}", .{e});
+    if (handoverFailure(ctx, "tuicr", reviewed)) |code| return code;
 
     const session = reviewSession(ctx, p.cwd) orelse
         return ctx.fail("tuicr recorded no review session for this checkout", .{});
@@ -2113,8 +2157,9 @@ fn login(ctx: *Ctx) u8 {
         .state_dir = state_dir,
     }) catch return 1) catch return 1;
 
-    _ = handSshInteractive(ctx, container) catch |e|
+    const logged_in = handSshInteractive(ctx, container) catch |e|
         return ctx.fail("ssh failed: {t}", .{e});
+    if (handoverFailure(ctx, "ssh", logged_in)) |code| return code;
 
     const store = project_mod.profileDir(ctx.arena, ctx.environ, profile) catch
         return ctx.fail("cannot work out where to store the token", .{});
@@ -2192,7 +2237,9 @@ fn vmStart(ctx: *Ctx) u8 {
         .qemu = qemu,
     }) catch return 1;
 
-    return handInteractive(ctx, argv) catch |e| ctx.fail("qemu failed: {t}", .{e});
+    const ended = handInteractive(ctx, argv) catch |e| return ctx.fail("qemu failed: {t}", .{e});
+    if (handoverFailure(ctx, "qemu", ended)) |code| return code;
+    return ended.code();
 }
 
 /// Downloads, verifies and decompresses the Fedora CoreOS disk. Returns a non-null exit
@@ -2404,9 +2451,10 @@ fn vmDestroy(ctx: *Ctx) u8 {
 /// `ssh.shellQuote`, because there the remote shell re-parsing it is the hazard.
 fn vmSsh(ctx: *Ctx) u8 {
     if (ctx.args.len == 0) {
-        const code = handSshInteractive(ctx, "") catch |e|
+        const ended = handSshInteractive(ctx, "") catch |e|
             return ctx.fail("ssh failed: {t}", .{e});
-        return code;
+        if (handoverFailure(ctx, "ssh", ended)) |code| return code;
+        return ended.code();
     }
 
     const remote = std.mem.join(ctx.arena, " ", ctx.args) catch return 1;

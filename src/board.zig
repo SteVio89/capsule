@@ -259,7 +259,7 @@ fn fetch(
     return parseFrame(arena, response.body);
 }
 
-/// Hands the terminal back, runs a capsule command on it, then restores the dashboard.
+/// Runs the command a menu entry names, filling in whatever its arguments ask for.
 ///
 /// The board acts by invoking the CLI it ships beside, rather than reimplementing anything
 /// against the daemon. `run start` alone is two batched ssh scripts, a seed tarball and a
@@ -268,13 +268,6 @@ fn fetch(
 ///
 /// Failures are swallowed on purpose: the command printed its own complaint on the
 /// terminal it was handed, and the dashboard's job is to come back either way.
-fn shellOut(t: *term.Term, io: Io, argv: []const []const u8) void {
-    t.leaveRaw();
-    defer t.enterRaw() catch {};
-    _ = exec.interactive(io, argv, .{}) catch {};
-}
-
-/// Runs the command a menu entry names, filling in whatever its arguments ask for.
 ///
 /// `cli.Command.args` is the help text's own spelling — `"<title>"`, `"[issue-id]"` — and
 /// it is the only place that records what a verb wants. Reading it here means the menu
@@ -308,7 +301,12 @@ fn runEntry(
         argv.append(arena, title) catch return;
     }
 
-    _ = exec.interactive(io, argv.items, .{}) catch {};
+    // Inherited rather than a `/dev/tty` of its own, because this hop is not the last one:
+    // the command it runs may hand the terminal on again, and `run review` does. Opening
+    // one here would put a capsule-opened descriptor under `tuicr` no matter what the
+    // command below chooses, which is exactly the arrangement it wedges on. Safe because
+    // the board only ever starts on a terminal.
+    _ = exec.interactive(io, argv.items, .{ .terminal = .inherited }) catch {};
 
     // Without this the dashboard repaints over the output within milliseconds, which is
     // why every command that only prints — `vm status`, `run list`, `project list` —

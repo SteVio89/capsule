@@ -81,6 +81,29 @@ pub fn masterArgs(arena: std.mem.Allocator, cfg: Config) ![]const []const u8 {
     return args.toOwnedSlice(arena);
 }
 
+/// capsule's ssh as one command line, for a caller that takes a string rather than an argv.
+///
+/// `git` is the only one. It spawns its own ssh for an `ssh://` remote, so without this the
+/// replica is reached with none of the options above — no connect timeout, no keepalive, no
+/// `accept-new`, and none of the multiplexing the daemon has already paid for. Handing it
+/// `core.sshCommand` is what makes git's ssh the same ssh as every other one capsule runs.
+///
+/// Every word is quoted because git splits this with its own shell-like parser: a control
+/// directory under a path containing a space would otherwise become two arguments.
+pub fn commandLine(arena: std.mem.Allocator, io: Io, cfg: Config) ![]const u8 {
+    ensureControlDir(arena, io, cfg);
+
+    const args = try baseArgs(arena, cfg);
+    var out: std.ArrayList(u8) = .empty;
+    var alloc = std.Io.Writer.Allocating.fromArrayList(arena, &out);
+    const w = &alloc.writer;
+    for (args.items, 0..) |word, i| {
+        if (i > 0) try w.writeByte(' ');
+        try w.writeAll(try shellQuote(arena, word));
+    }
+    return alloc.written();
+}
+
 /// `ssh -O <verb>` against the shared master — `check` to probe it, `exit` to tear it
 /// down. The argv is allocated in `arena`, which owns it.
 pub fn controlArgs(arena: std.mem.Allocator, cfg: Config, verb: []const u8) ![]const []const u8 {
@@ -231,7 +254,7 @@ pub fn run(
 
 /// Runs `remote` on the VM with the terminal handed over, for a session the user drives.
 /// No timeout: the user decides when an interactive session is over.
-pub fn interactive(arena: std.mem.Allocator, io: Io, cfg: Config, remote: []const u8) exec.Error!u8 {
+pub fn interactive(arena: std.mem.Allocator, io: Io, cfg: Config, remote: []const u8) exec.Error!exec.Exit {
     ensureControlDir(arena, io, cfg);
     return exec.interactive(io, try execTtyArgs(arena, cfg, remote), .{});
 }
@@ -446,6 +469,44 @@ test "the remote command is one argument, so the remote shell parses it once" {
     const argv = try execArgs(a.allocator(), test_cfg, remote);
     try testing.expectEqualStrings(remote, argv[argv.len - 1]);
     try testing.expectEqualStrings(test_cfg.vm_host, argv[argv.len - 2]);
+}
+
+test "the command line for git carries the options git's own ssh would not have" {
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const line = try commandLine(arena, testing.io, .{
+        .vm_host = "core@localhost",
+        .vm_port = 2222,
+        .control_dir = "/tmp/cm",
+    });
+
+    try testing.expect(std.mem.startsWith(u8, line, "'ssh'"));
+    // Each of these is a hang or a prompt when git spawns ssh without it.
+    try testing.expect(std.mem.indexOf(u8, line, "'ConnectTimeout=10'") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "'ServerAliveInterval=15'") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "'StrictHostKeyChecking=accept-new'") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "'ControlPath=/tmp/cm/cm-%C'") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "'2222'") != null);
+
+    // The host is deliberately absent: git appends its own from the remote URL, and a
+    // second one here would make the command line reach the wrong machine.
+    try testing.expect(std.mem.indexOf(u8, line, "core@localhost") == null);
+}
+
+test "a control directory with a space stays one argument" {
+    // git splits `core.sshCommand` with a shell-like parser, so an unquoted path under
+    // something like `/Users/a b/` would silently become two arguments and the option
+    // would be dropped.
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+
+    const line = try commandLine(a.allocator(), testing.io, .{
+        .vm_host = "core@localhost",
+        .control_dir = "/tmp/a b/cm",
+    });
+    try testing.expect(std.mem.indexOf(u8, line, "'ControlPath=/tmp/a b/cm/cm-%C'") != null);
 }
 
 test "an interactive session gets its own connection, not the shared master" {

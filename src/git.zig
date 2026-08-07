@@ -20,12 +20,22 @@ pub const Error = error{
     GitMissing,
 } || exec.Error;
 
+/// Wall-clock cap on the commands that reach the replica.
+///
+/// `ssh.zig` bounds every connection capsule opens itself, but git spawns its own ssh, so
+/// the bound has to be put back here for the ones git makes. Generous rather than tight:
+/// the VM is on localhost, so this is catching a hang, not slow work.
+const vm_timeout_s: u32 = 120;
+
 /// Git bound to one working directory, so callers do not repeat `-C`.
 pub const Git = struct {
     arena: std.mem.Allocator,
     io: Io,
     /// Null runs in capsule's own working directory.
     dir: ?[]const u8 = null,
+    /// capsule's ssh as one command line, for git's `core.sshCommand`. Null leaves git to
+    /// its own ssh, which is what a repository with no replica wants.
+    ssh_command: ?[]const u8 = null,
 
     /// Builds `git [-C <dir>] <args...>`. The `-C` form is used rather than spawning with
     /// a different cwd so the command is reproducible from the log line alone.
@@ -40,9 +50,40 @@ pub const Git = struct {
         return out.toOwnedSlice(self.arena);
     }
 
+    /// Builds the argv for a command that reaches the replica: `argv` plus capsule's ssh.
+    ///
+    /// `-c core.sshCommand=` rather than the environment, because `exec.Options.environ`
+    /// replaces the child's environment wholesale and every VM call would have to copy the
+    /// whole map first. It is set for the git process rather than one remote, which is safe
+    /// only because the commands using it name `vm` explicitly — a bare `git fetch` here
+    /// would reach `origin` on the VM's port.
+    ///
+    /// Public for the same reason `argv` is: this is the part worth asserting on.
+    pub fn vmArgv(self: Git, args: []const []const u8) ![]const []const u8 {
+        var full: std.ArrayList([]const u8) = .empty;
+        if (self.ssh_command) |cmd| {
+            try full.appendSlice(self.arena, &.{
+                "-c",
+                try std.fmt.allocPrint(self.arena, "core.sshCommand={s}", .{cmd}),
+            });
+        }
+        try full.appendSlice(self.arena, args);
+        return self.argv(full.items);
+    }
+
     /// Runs and captures, leaving the exit code for the caller to interpret.
     pub fn run(self: Git, args: []const []const u8) exec.Error!exec.Output {
         return exec.run(self.arena, self.io, try self.argv(args), .{});
+    }
+
+    /// `run` for a command that reaches the replica, which is the only kind that can hang.
+    pub fn runOnVm(self: Git, args: []const []const u8) exec.Error!exec.Output {
+        return exec.run(self.arena, self.io, try self.vmArgv(args), .{
+            .timeout = .{ .duration = .{
+                .raw = .{ .nanoseconds = @as(u64, vm_timeout_s) * std.time.ns_per_s },
+                .clock = .awake,
+            } },
+        });
     }
 
     /// Trimmed stdout, or `error.ExitFailure` when git said no.
@@ -71,13 +112,13 @@ pub fn issueBranch(arena: std.mem.Allocator, full_id: []const u8) ![]const u8 {
 
 /// `git fetch vm` — refs only, so nothing in the working tree moves.
 pub fn fetch(g: Git) exec.Error!exec.Output {
-    return g.run(&.{ "fetch", "-q", remote });
+    return g.runOnVm(&.{ "fetch", "-q", remote });
 }
 
 /// Pushes the current HEAD onto an issue's branch in the replica.
 pub fn pushToBranch(g: Git, branch: []const u8) exec.Error!exec.Output {
     const refspec = try std.fmt.allocPrint(g.arena, "HEAD:{s}", .{branch});
-    return g.run(&.{ "push", remote, refspec });
+    return g.runOnVm(&.{ "push", remote, refspec });
 }
 
 /// Whether a ref resolves. Used to tell "the agent has not pushed yet" from "something
@@ -174,6 +215,46 @@ test "the command line keeps every argument whole" {
     try testing.expectEqualStrings("commit", line[3]);
     try testing.expectEqualStrings("-m", line[4]);
     try testing.expectEqualStrings("a message; with $(punctuation)", line[5]);
+}
+
+test "a replica command carries capsule's ssh, before the subcommand" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const g = Git{
+        .arena = arena.allocator(),
+        .io = testing.io,
+        .dir = "/repo",
+        .ssh_command = "ssh -o 'ConnectTimeout=10' -p '2222'",
+    };
+    const line = try g.vmArgv(&.{ "fetch", "-q", remote });
+
+    // `-c` has to land before the subcommand or git rejects it, and after `-C` is where
+    // the existing builder puts everything it adds.
+    try testing.expectEqualStrings("git", line[0]);
+    try testing.expectEqualStrings("-C", line[1]);
+    try testing.expectEqualStrings("/repo", line[2]);
+    try testing.expectEqualStrings("-c", line[3]);
+    try testing.expectEqualStrings(
+        "core.sshCommand=ssh -o 'ConnectTimeout=10' -p '2222'",
+        line[4],
+    );
+    try testing.expectEqualStrings("fetch", line[5]);
+    try testing.expectEqualStrings(remote, line[7]);
+}
+
+test "without an ssh command a replica command is exactly the plain one" {
+    // A repository with no replica must not grow a `-c` with an empty value, which git
+    // reads as a config key with no name and refuses.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const g = Git{ .arena = arena.allocator(), .io = testing.io };
+    const line = try g.vmArgv(&.{ "fetch", "-q", remote });
+
+    try testing.expectEqual(@as(usize, 4), line.len);
+    try testing.expectEqualStrings("git", line[0]);
+    try testing.expectEqualStrings("fetch", line[1]);
 }
 
 test "without a directory there is no -C at all" {
